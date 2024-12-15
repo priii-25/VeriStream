@@ -30,6 +30,7 @@ st.markdown(
         <a href="?page=live_feed">Live Feed</a>
         <a href="?page=gis">GIS</a>
         <a href="?page=knowledge_graph">Knowledge Graph</a>
+        <a href="?page=settings">Settings</a>
     </div>
     """,
     unsafe_allow_html=True,
@@ -45,6 +46,8 @@ elif query_params.get("page") == "gis":
 elif query_params.get("page") == "knowledge_graph":
     st.markdown("### Knowledge Graph Section")
     st.write("[Knowledge Graph content will appear here]")
+elif query_params.get("page") == "settings":
+    import settings
 else:
     st.markdown("### Search")
     st.text_input("", placeholder="Search...")
