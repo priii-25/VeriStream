@@ -2,3 +2,9 @@ pandas
 plotly
 streamlit
 statsmodel
+langchain
+transformers
+python-dotenv
+langchain_google_genai
+tensorflow
+tf-keras
