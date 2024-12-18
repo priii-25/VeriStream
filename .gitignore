@@ -9,6 +9,8 @@ __pycache__/
 # Distribution / packaging
 .db
 **/*.csv
+**/*.json
+*.html
 .Python
 build/
 develop-eggs/
