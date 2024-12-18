@@ -57,7 +57,7 @@ def analyze_text(text):
     }
 
 if __name__ == "__main__":
-    input_text = "Breaking: Deadly virus spreading rapidly in your city!"
+    input_text = "it was a day"
     result = analyze_text(input_text)
 
     print("\nAnalysis Results:")

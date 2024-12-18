@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .db
+/factcheck-env
 **/*.csv
 **/*.json
 *.html
