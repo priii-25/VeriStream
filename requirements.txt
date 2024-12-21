@@ -8,3 +8,7 @@ python-dotenv
 langchain_google_genai
 tensorflow
 tf-keras
+opencv-python
+whisper 
+kafka-python
+pyspark

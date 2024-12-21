@@ -4,12 +4,12 @@ col1, col2 = st.columns([7, 3])
 
 with col1:
     st.markdown("## Live Streaming")
-    st.video('https://www.youtube.com/watch?v=Io-G_aiF8HA')  
+    st.video('')  
     st.write("[Video content will appear here]")
 
 with col2:
-    st.markdown("## Flagged Content")
-    st.write("[Flagged content will appear here]")
+    st.markdown("## Transcription")
+    st.write("[Transciption will appear here]")
 
 st.markdown(
     """
