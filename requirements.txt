@@ -1,7 +1,6 @@
 pandas
 plotly
 streamlit
-statsmodel
 langchain
 transformers
 python-dotenv
@@ -13,6 +12,6 @@ whisper
 kafka-python
 pyspark
 scikit-learn
-faiss-cpu-gpu
+faiss-cpu
 matplotlib
 statsmodels
