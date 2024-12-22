@@ -12,3 +12,7 @@ opencv-python
 whisper 
 kafka-python
 pyspark
+scikit-learn
+faiss-cpu-gpu
+matplotlib
+statsmodels
