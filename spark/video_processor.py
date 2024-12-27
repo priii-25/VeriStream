@@ -1,25 +1,21 @@
 import os
 from kafka import KafkaProducer, KafkaConsumer
 import cv2
-from base64 import b64encode  
+from base64 import b64encode
 import json
 import numpy as np
 from datetime import datetime
-import whisper
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
 
 class VideoProducer:
     def __init__(self):
         self.producer = KafkaProducer(
-            bootstrap_servers=['localhost:29092'],  
+            bootstrap_servers=['localhost:29092'],
             value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-            max_request_size=10485760  
+            max_request_size=10485760  # 10MB max size
         )
 
     def video_to_frames(self, video_path, batch_size=30):
-        """Convert video to batches of frames"""
+        """Convert video to batches of frames."""
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
             
@@ -31,10 +27,9 @@ class VideoProducer:
             ret, frame = cap.read()
             if not ret:
                 break
-            
             frame = cv2.resize(frame, (640, 480))
             _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            encoded_frame = b64encode(buffer).decode('utf-8')  
+            encoded_frame = b64encode(buffer).decode('utf-8')
             
             frames.append({
                 'frame_id': frame_count,
@@ -54,7 +49,7 @@ class VideoProducer:
         cap.release()
 
     def send_video(self, video_path, topic_name="video-frames"):
-        """Send video frames to Kafka topic"""
+        """Send video frames to a Kafka topic."""
         print(f"Starting to process video: {video_path}")
         try:
             for batch in self.video_to_frames(video_path):
@@ -71,7 +66,7 @@ class VideoProducer:
             print("Producer closed")
 
 def test_consumer():
-    """Simple consumer to verify Kafka messages"""
+    """Simple consumer to verify Kafka messages."""
     consumer = KafkaConsumer(
         'video-frames',
         bootstrap_servers=['localhost:29092'],

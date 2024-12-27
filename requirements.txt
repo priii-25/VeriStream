@@ -8,10 +8,16 @@ langchain_google_genai
 tensorflow
 tf-keras
 opencv-python
-whisper 
+openai-whisper
 kafka-python
 pyspark
 scikit-learn
 faiss-cpu
 matplotlib
 statsmodels
+torch
+efficientnet_pytorch
+facenet_pytorch
+whisper
+torchvision
+torchtext
