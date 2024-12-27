@@ -1,141 +1,125 @@
 import os
-import faiss
-import numpy as np
-from transformers import AutoTokenizer, AutoModel, AutoModelForSeq2SeqLM
-from typing import List, Dict, Any
 import requests
 
-API_KEY = os.getenv("API_KEY")
-FACT_CHECK_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
+# For demonstration: Hugging Face for NER and classification
+from transformers import pipeline
 
-def search_fact_check(claim: str) -> List[str]:
+# LangChain imports for RAG and/or LLM usage
+from langchain.chains import RetrievalQA
+from langchain.llms import HuggingFacePipeline
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.docstore.document import Document
+from transformers import pipeline
+
+API_KEY ="AIzaSyA_o1LhjLi2vIi1sgTUStzeTBiUFrGOLYI"
+BASE_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
+
+def search_fact_check(claim: str):
     """
-    Fetch fact-checking results for a given claim using the Google Fact Check API.
-    Args:
-        claim (str): Claim to fact-check.
-    Returns:
-        List[str]: List of fact-checked statements and their reviews.
+    Queries the Google FactCheck Tools API to find fact-checking information
+    related to a specific claim.
     """
     params = {
         "query": claim,
         "key": API_KEY
     }
     try:
-        response = requests.get(FACT_CHECK_URL, params=params)
+        response = requests.get(BASE_URL, params=params)
         response.raise_for_status()
-        data = response.json()
-        documents = []
-        for claim_item in data.get("claims", []):
-            text = claim_item.get("text", "")
-            for review in claim_item.get("claimReview", []):
-                publisher = review.get("publisher", {}).get("name", "Unknown Publisher")
-                rating = review.get("textualRating", "No Rating")
-                url = review.get("url", "No URL")
-                documents.append(f"{text} - Reviewed by {publisher} ({rating}): {url}")
-        return documents
+        return response.json()
     except requests.exceptions.RequestException as e:
-        print(f"Error during fact-checking: {e}")
-        return []
+        return {"error": str(e)}
 
-class RAGPipeline:
-    def __init__(self, model_name: str, retriever_model_name: str, documents: List[str]):
-        """
-        Initialize RAG Pipeline with document embedding and retrieval.
-        Args:
-            model_name (str): Hugging Face model for LLM.
-            retriever_model_name (str): Hugging Face model for dense retrieval.
-            documents (List[str]): Corpus of documents for knowledge retrieval.
-        """
-        self.documents = documents
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.llm = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-        
-        self.retriever_tokenizer = AutoTokenizer.from_pretrained(retriever_model_name)
-        self.retriever_model = AutoModel.from_pretrained(retriever_model_name)
-        
-        self.index, self.embedded_docs = self.build_index(documents)
+def main_claim_pipeline(claim_text: str):
+    """
+    Main function:
+      1. Retrieves fact-check data with the FactCheck Tools API.
+      2. Performs NER on the claim to identify entities.
+      3. Uses zero-shot classification to produce a "true" / "false" result with a confidence score.
+      4. Integrates RAG + an LLM via LangChain to demonstrate combined outputs.
+    """
 
-    def embed_text(self, text: str) -> np.ndarray:
-        """
-        Embed text using the retriever model.
-        Args:
-            text (str): Input text to embed.
-        Returns:
-            np.ndarray: Embedded representation of the text.
-        """
-        inputs = self.retriever_tokenizer(text, return_tensors="pt", truncation=True, padding=True)
-        with torch.no_grad():
-            outputs = self.retriever_model(**inputs)
-        return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
-
-    def build_index(self, documents: List[str]) -> (faiss.IndexFlatL2, List[str]):
-        """
-        Build FAISS index for document embeddings.
-        Args:
-            documents (List[str]): Corpus of documents.
-        Returns:
-            faiss.IndexFlatL2: FAISS index for retrieval.
-            List[str]: Original document list (to fetch results).
-        """
-        embeddings = [self.embed_text(doc) for doc in documents]
-        embedding_matrix = np.stack(embeddings)
-        index = faiss.IndexFlatL2(embedding_matrix.shape[1])
-        index.add(embedding_matrix)
-        return index, documents
-
-    def retrieve_documents(self, query: str, top_k: int = 3) -> List[str]:
-        """
-        Retrieve top-k relevant documents for a given query.
-        Args:
-            query (str): Query string.
-            top_k (int): Number of top documents to retrieve.
-        Returns:
-            List[str]: Top-k relevant documents.
-        """
-        query_embedding = self.embed_text(query).reshape(1, -1)
-        distances, indices = self.index.search(query_embedding, top_k)
-        return [self.documents[i] for i in indices[0]]
-
-    def generate_response(self, query: str, context: List[str]) -> str:
-        """
-        Generate response using LLM with the retrieved context.
-        Args:
-            query (str): Query string.
-            context (List[str]): Retrieved contextual documents.
-        Returns:
-            str: Generated response.
-        """
-        context_text = " ".join(context)
-        input_text = f"Context: {context_text}\n\nQuery: {query}\n\nAnswer:"
-        inputs = self.tokenizer(input_text, return_tensors="pt", truncation=True, padding=True)
-        outputs = self.llm.generate(**inputs, max_length=256, num_return_sequences=1)
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-def main():
-    claims = [
-        "Narendra Modi is the best prime minister of India",
-    ]
-
-    all_documents = []
-    for claim in claims:
-        documents = search_fact_check(claim)
-        all_documents.extend(documents)
-
-    if not all_documents:
-        print("No fact-checked documents found. Please refine the queries.")
+    # --- Step 1: Retrieve fact-check data ---
+    factcheck_result = search_fact_check(claim_text)
+    if "error" in factcheck_result:
+        print(f"Error accessing FactCheck Tools API: {factcheck_result['error']}")
         return
 
-    model_name = "google/flan-t5-base" 
-    retriever_model_name = "sentence-transformers/all-mpnet-base-v2"
-    rag_pipeline = RAGPipeline(model_name=model_name, retriever_model_name=retriever_model_name, documents=all_documents)
-    
-    for claim in claims:
-        print(f"\n{'='*50}\nQuery: {claim}\n{'='*50}")
-        result = rag_pipeline.retrieve_documents(claim)
-        response = rag_pipeline.generate_response(claim, result)
-        print(f"Retrieved Documents: {result}")
-        print(f"Generated Response: {response}")
+    print("Fact-Checked Results from Google FactCheck Tools:")
+    claims_data = factcheck_result.get("claims", [])
+    if not claims_data:
+        print("No claims found for the given query.\n")
+    else:
+        for claim in claims_data:
+            text = claim.get('text', 'N/A')
+            claimant = claim.get('claimant', 'N/A')
+            claim_date = claim.get('claimDate', 'N/A')
+            print(f"Claim: {text}")
+            print(f"Claimant: {claimant}")
+            print(f"Claimed Date: {claim_date}")
+            for review in claim.get('claimReview', []):
+                publisher_name = review.get('publisher', {}).get('name', 'N/A')
+                textual_rating = review.get('textualRating', 'N/A')
+                review_url = review.get('url', 'N/A')
+                print(f"  Publisher: {publisher_name}")
+                print(f"  Rating: {textual_rating}")
+                print(f"  URL: {review_url}")
+            print("-" * 50)
+
+    # --- Step 2: Perform NER on the user-submitted claim ---
+    ner_pipeline = pipeline(
+        task="ner",
+        model="dslim/bert-base-NER",
+        aggregation_strategy="simple"
+    )
+    ner_results = ner_pipeline(claim_text)
+    print("\nNamed Entities in the Claim Text:")
+    for entity in ner_results:
+        entity_text = entity['word']
+        entity_type = entity['entity_group']
+        print(f"  - {entity_text} ({entity_type})")
+
+    # --- Step 3: Classify the claim as 'true' or 'false' ---
+    zero_shot_classifier = pipeline(
+        task="zero-shot-classification",
+        model="facebook/bart-large-mnli"
+    )
+    possible_labels = ["true claim", "false claim"]
+    classification_result = zero_shot_classifier(claim_text, possible_labels)
+
+    top_label = classification_result["labels"][0]
+    top_score = classification_result["scores"][0]
+
+    print("\nClaim Classification:")
+    if top_label == "true claim":
+        print(f"Inferred to be TRUE with confidence {top_score:.2f}")
+    else:
+        print(f"Inferred to be FALSE with confidence {top_score:.2f}")
+
+    # --- Step 4: Demonstrate using LangChain for RAG or LLM output ---
+    if claims_data:
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        docs = []
+        for claim_item in claims_data:
+            claim_text_data = claim_item.get("text", "")
+            docs.append(Document(page_content=claim_text_data))
+
+        vectorstore = FAISS.from_documents(docs, embeddings)
+
+        access_token = "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"
+        llama_pipeline = pipeline("text-generation",model="meta-llama/Llama-2-7b",use_auth_token=access_token)
+
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llama_pipeline,
+            chain_type="stuff",
+            retriever=vectorstore.as_retriever()
+        )
+
+        question = f"What do we know about the claim: '{claim_text}' based on the retrieved fact-check data?"
+        final_answer = qa_chain.run(question)
+        print("\nRAG-based answer from LLM:\n", final_answer)
 
 if __name__ == "__main__":
-    main()
+    user_claim = "COVID-19 vaccines are ineffective."
+    main_claim_pipeline(user_claim)
