@@ -21,3 +21,6 @@ facenet_pytorch
 whisper
 torchvision
 torchtext
+langchain_community
+sentence-transformers
+pyvis
