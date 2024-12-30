@@ -24,3 +24,6 @@ torchtext
 langchain_community
 sentence-transformers
 pyvis
+prometheus-client 
+pynvml
+psutil

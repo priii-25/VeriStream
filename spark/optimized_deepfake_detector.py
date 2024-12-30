@@ -35,7 +35,8 @@ class OptimizedDeepfakeDetector(nn.Module):
         
         if not torch.cuda.is_available():
             try:
-                self.backbone = torch.jit.script(self.backbone)
+                # self.backbone = torch.jit.script(self.backbone)
+                print("JIT compiling backbone...")
             except Exception as e:
                 print(f"Warning: JIT compilation failed: {e}")
         
