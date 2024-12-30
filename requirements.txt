@@ -27,3 +27,4 @@ pyvis
 prometheus-client 
 pynvml
 psutil
+moviepy
