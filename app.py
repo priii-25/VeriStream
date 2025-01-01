@@ -4,6 +4,7 @@ from video_processor import VideoProducer
 from spark_video_processor import SparkVideoProcessor, SparkTranscriptionProcessor
 import threading
 import time
+import requests
 import whisper
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError
@@ -35,8 +36,17 @@ from pyvis.network import Network
 from pathlib import Path
 import sys
 from concurrent.futures import ThreadPoolExecutor
+import folium
+import geopandas as gpd
+from geopy.geocoders import Nominatim
+from pymongo import MongoClient
+from streamlit_folium import folium_static
+from deep_translator import GoogleTranslator
+from langdetect import detect
 
-# Configure logging
+load_dotenv()
+translator = GoogleTranslator(source='auto', target='en')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -45,15 +55,163 @@ logging.basicConfig(
         logging.FileHandler('fact_checker.log')
     ]
 )
-logger = logging.getLogger('fact_checker')
+logger = logging.getLogger('veristream')
 
-# Constants
 CACHE_TTL = 3600
 MAX_RETRIES = 3
 TIMEOUT = 30
 BATCH_SIZE = 5
 
-# Initialize metrics collector
+mongodb_uri = os.getenv("MONGODB_URI")
+db_name = os.getenv("MONGODB_DB_NAME")
+collection_name = os.getenv("MONGODB_COLLECTION_NAME")
+
+LANGUAGE_MAPPING = {
+    "Afrikaans": "af",
+    "Albanian": "sq",
+    "Amharic": "am",
+    "Arabic": "ar",
+    "Armenian": "hy",
+    "Assamese": "as",
+    "Aymara": "ay",
+    "Azerbaijani": "az",
+    "Bambara": "bm",
+    "Basque": "eu",
+    "Belarusian": "be",
+    "Bengali": "bn",
+    "Bhojpuri": "bho",
+    "Bosnian": "bs",
+    "Bulgarian": "bg",
+    "Catalan": "ca",
+    "Cebuano": "ceb",
+    "Chichewa": "ny",
+    "Chinese (Simplified)": "zh-CN",
+    "Chinese (Traditional)": "zh-TW",
+    "Corsican": "co",
+    "Croatian": "hr",
+    "Czech": "cs",
+    "Danish": "da",
+    "Dhivehi": "dv",
+    "Dogri": "doi",
+    "Dutch": "nl",
+    "English": "en",
+    "Esperanto": "eo",
+    "Estonian": "et",
+    "Ewe": "ee",
+    "Filipino": "tl",
+    "Finnish": "fi",
+    "French": "fr",
+    "Frisian": "fy",
+    "Galician": "gl",
+    "Georgian": "ka",
+    "German": "de",
+    "Greek": "el",
+    "Guarani": "gn",
+    "Gujarati": "gu",
+    "Haitian Creole": "ht",
+    "Hausa": "ha",
+    "Hawaiian": "haw",
+    "Hebrew": "iw",
+    "Hindi": "hi",
+    "Hmong": "hmn",
+    "Hungarian": "hu",
+    "Icelandic": "is",
+    "Igbo": "ig",
+    "Ilocano": "ilo",
+    "Indonesian": "id",
+    "Irish": "ga",
+    "Italian": "it",
+    "Japanese": "ja",
+    "Javanese": "jw",
+    "Kannada": "kn",
+    "Kazakh": "kk",
+    "Khmer": "km",
+    "Kinyarwanda": "rw",
+    "Konkani": "gom",
+    "Korean": "ko",
+    "Krio": "kri",
+    "Kurdish (Kurmanji)": "ku",
+    "Kurdish (Sorani)": "ckb",
+    "Kyrgyz": "ky",
+    "Lao": "lo",
+    "Latin": "la",
+    "Latvian": "lv",
+    "Lingala": "ln",
+    "Lithuanian": "lt",
+    "Luganda": "lg",
+    "Luxembourgish": "lb",
+    "Macedonian": "mk",
+    "Maithili": "mai",
+    "Malagasy": "mg",
+    "Malay": "ms",
+    "Malayalam": "ml",
+    "Maltese": "mt",
+    "Maori": "mi",
+    "Marathi": "mr",
+    "Meiteilon (Manipuri)": "mni-Mtei",
+    "Mizo": "lus",
+    "Mongolian": "mn",
+    "Myanmar": "my",
+    "Nepali": "ne",
+    "Norwegian": "no",
+    "Odia (Oriya)": "or",
+    "Oromo": "om",
+    "Pashto": "ps",
+    "Persian": "fa",
+    "Polish": "pl",
+    "Portuguese": "pt",
+    "Punjabi": "pa",
+    "Quechua": "qu",
+    "Romanian": "ro",
+    "Russian": "ru",
+    "Samoan": "sm",
+    "Sanskrit": "sa",
+    "Scots Gaelic": "gd",
+    "Sepedi": "nso",
+    "Serbian": "sr",
+    "Sesotho": "st",
+    "Shona": "sn",
+    "Sindhi": "sd",
+    "Sinhala": "si",
+    "Slovak": "sk",
+    "Slovenian": "sl",
+    "Somali": "so",
+    "Spanish": "es",
+    "Sundanese": "su",
+    "Swahili": "sw",
+    "Swedish": "sv",
+    "Tajik": "tg",
+    "Tamil": "ta",
+    "Tatar": "tt",
+    "Telugu": "te",
+    "Thai": "th",
+    "Tigrinya": "ti",
+    "Tsonga": "ts",
+    "Turkish": "tr",
+    "Turkmen": "tk",
+    "Twi": "ak",
+    "Ukrainian": "uk",
+    "Urdu": "ur",
+    "Uyghur": "ug",
+    "Uzbek": "uz",
+    "Vietnamese": "vi",
+    "Welsh": "cy",
+    "Xhosa": "xh",
+    "Yiddish": "yi",
+    "Yoruba": "yo",
+    "Zulu": "zu",
+}
+
+SENTIMENT_LABEL_MAPPING = {
+    "LABEL_0": "Negative",
+    "LABEL_1": "Neutral",
+    "LABEL_2": "Positive"
+}
+
+if not mongodb_uri or not db_name or not collection_name:
+    raise ValueError("Missing required environment variables. Please check your .env file.")
+
+
 metrics = MetricsCollector(port=8000)
 
 @dataclass
@@ -67,6 +225,7 @@ class AnalysisResult:
     manipulation_score: float
     processing_time: float
     entities: List[Dict]
+    locations: List[Dict]
     knowledge_graph: Optional[Dict] = None
     generative_analysis: Optional[Dict] = None
 
@@ -79,13 +238,11 @@ class KnowledgeGraphManager:
         if not fact_checks:
             return "Not Confirmed", "No fact checks available"
         
-        # Get the most recent fact check
         latest_check = fact_checks[0]
         if 'claimReview' in latest_check and latest_check['claimReview']:
             review = latest_check['claimReview'][0]
             rating = review.get('textualRating', '').lower()
             
-            # Classify the rating
             if any(word in rating for word in ['true', 'correct', 'accurate']):
                 return "Verified True", review.get('textualRating', '')
             elif any(word in rating for word in ['false', 'incorrect', 'inaccurate']):
@@ -97,27 +254,22 @@ class KnowledgeGraphManager:
 
     def add_fact(self, text: str, entities: List[Dict], fact_checks: List[Dict], sentiment: Dict):
         """Add a fact and its related information to the knowledge graph"""
-        # Add fact node
         fact_id = f"fact_{hash(text)}"
         self.graph.add_node(fact_id, 
                           type='fact',
                           text=text,
                           sentiment=sentiment.get('label', 'NEUTRAL'))
         
-        # Get verification status
         verification_status, verification_details = self.get_verification_status(fact_checks)
         
-        # Add verification node
         verification_id = f"verification_{fact_id}"
         self.graph.add_node(verification_id,
                          type='verification',
                          status=verification_status,
                          details=verification_details)
         
-        # Connect fact to verification
         self.graph.add_edge(fact_id, verification_id, relation='verified_as')
         
-        # Add entity nodes and connect to both fact and verification status
         for entity in entities:
             entity_id = f"entity_{hash(entity['text'])}"
             self.graph.add_node(entity_id,
@@ -125,14 +277,11 @@ class KnowledgeGraphManager:
                              text=entity['text'],
                              entity_type=entity['type'])
             
-            # Connect entity to fact
             self.graph.add_edge(entity_id, fact_id, relation='mentioned_in')
             
-            # Connect entity to verification status
             self.graph.add_edge(entity_id, verification_id, 
                               relation=f"verified_{verification_status.lower().replace(' ', '_')}")
         
-        # Add fact check nodes if available
         for i, check in enumerate(fact_checks):
             if 'claimReview' in check and check['claimReview']:
                 review = check['claimReview'][0]
@@ -153,7 +302,6 @@ class KnowledgeGraphManager:
 
     def visualize_graph(self, output_file: str = 'knowledge_graph.html'):
         """Create interactive and static visualizations of the knowledge graph"""
-        # Define color scheme
         colors = {
             'fact': '#ff7f7f',
             'entity': '#7f7fff',
@@ -167,11 +315,9 @@ class KnowledgeGraphManager:
         }
 
         try:
-            # 1. Create Pyvis visualization
             net = Network(height='750px', width='100%', bgcolor='#ffffff', font_color='#000000')
             net.barnes_hut()
 
-            # Add nodes with enhanced styling
             for node, data in self.graph.nodes(data=True):
                 title = f"Type: {data['type']}<br>"
             
@@ -195,14 +341,12 @@ class KnowledgeGraphManager:
                             color=node_color,
                             size=30 if data['type'] in ['verification', 'fact'] else 20)
 
-            # Add edges with relationship labels
             for edge in self.graph.edges(data=True):
                 net.add_edge(str(edge[0]), 
                             str(edge[1]), 
                             title=edge[2].get('relation', ''),
                             physics=True)
 
-            # Configure physics settings
             physics_settings = {
                 "physics": {
                     "barnesHut": {
@@ -219,21 +363,17 @@ class KnowledgeGraphManager:
             net.set_options(json.dumps(physics_settings))
 
             try:
-                # Attempt to save the interactive visualization
                 net.save_graph(output_file)
             except Exception as e:
                 logger.error(f"Failed to save interactive visualization: {e}")
-            # Continue with static visualization even if interactive fails
 
         except Exception as e:
             logger.error(f"Failed to create interactive visualization: {e}")
 
         try:
-            # 2. Create static matplotlib visualization
             plt.figure(figsize=(15, 10))
             pos = nx.spring_layout(self.graph, k=1, iterations=50)
         
-            # Draw nodes by type
             node_types = ['fact', 'entity', 'verification', 'fact_check']
             for node_type in node_types:
                 if node_type == 'verification':
@@ -256,14 +396,12 @@ class KnowledgeGraphManager:
                                             node_size=1500 if node_type == 'fact' else 1000,
                                             alpha=0.7)
         
-            # Draw edges with arrows
             nx.draw_networkx_edges(self.graph, pos, 
                                  edge_color='gray', 
                                  arrows=True, 
                                  arrowsize=20,
                                  alpha=0.5)
         
-            # Add labels with better positioning
             labels = {}
             for node, data in self.graph.nodes(data=True):
                 if data['type'] == 'fact':
@@ -277,12 +415,10 @@ class KnowledgeGraphManager:
         
             nx.draw_networkx_labels(self.graph, pos, labels, font_size=8)
         
-            # Add comprehensive legend
             legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
                                         markerfacecolor=color, label=f"Node: {label}", markersize=10)
                              for label, color in colors.items() if isinstance(color, str)]
         
-            # Add verification status to legend
             for status, color in colors['verification'].items():
                 legend_elements.append(plt.Line2D([0], [0], marker='o', color='w',
                                                 markerfacecolor=color, label=f"Status: {status}",
@@ -297,12 +433,10 @@ class KnowledgeGraphManager:
             plt.axis('off')
             plt.tight_layout()
         
-            # Save static visualization
             static_output = 'knowledge_graph_static.png'
             plt.savefig(static_output, bbox_inches='tight', dpi=300)
             plt.close()
 
-            # 3. Create an HTML file combining both visualizations
             html_content = f"""
             <!DOCTYPE html>
             <html>
@@ -386,7 +520,6 @@ class KnowledgeGraphManager:
                         <ul>
             """
         
-            # Add node information
             for node, data in self.graph.nodes(data=True):
                 html_content += f"<li><strong>{node}</strong>: {str(data)}</li>"
         
@@ -398,7 +531,6 @@ class KnowledgeGraphManager:
         </html>
         """
         
-            # Save combined HTML visualization
             combined_output = 'knowledge_graph_combined.html'
             with open(combined_output, 'w', encoding='utf-8') as f:
                 f.write(html_content)
@@ -412,20 +544,38 @@ class KnowledgeGraphManager:
             'static': static_output,
             'combined': combined_output
         }
+    
+class MongoDBManager:
+    def __init__(self, uri: str, db_name: str, collection_name: str):
+        self.client = MongoClient(uri)
+        self.db = self.client[db_name]
+        self.collection = self.db[collection_name]
+
+    def insert_location(self, location: str, metadata: Dict = None):
+        """Insert a location into the MongoDB collection."""
+        document = {
+            'location': location,
+            'timestamp': datetime.now(),
+            'metadata': metadata if metadata else {}
+        }
+        self.collection.insert_one(document)
+
+    def get_all_locations(self):
+        """Retrieve all locations from the MongoDB collection."""
+        return list(self.collection.find({}, {'_id': 0}))
+    
+mongo_manager = MongoDBManager(mongodb_uri, db_name, collection_name)
+
 
 class OptimizedAnalyzer:
     def __init__(self, use_gpu: bool = False):
         """Initialize the analyzer with all required components"""
-        load_dotenv()
         self.fact_check_api_key = os.getenv('FACT_CHECK_API_KEY')
         self.logger = logging.getLogger('analyzer')
         self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
 
-        # API keys
         self.fact_check_api_key = os.getenv('FACT_CHECK_API_KEY')
         self.google_api_key = os.getenv('GOOGLE_API_KEY')
-        
-        # Initialize components
         self.session = None
         self.cache_file = Path('analysis_cache.json')
         self.knowledge_graph = KnowledgeGraphManager()
@@ -470,12 +620,73 @@ class OptimizedAnalyzer:
         """Setup patterns for emotional and stereotype detection"""
         self.EMOTIONAL_TRIGGERS = [
             r"breaking news", r"fear of", r"unprecedented", r"urgent",
-            r"shocking", r"critical", r"emergency", r"life-changing"
+            r"shocking", r"critical", r"emergency", r"life-changing",
+            r"act now", r"time is running out", r"don't miss out",
+            r"last chance", r"limited time", r"before it's too late",
+            r"alert", r"warning", r"danger", r"crisis", r"panic",
+            r"disaster", r"catastrophe", r"chaos", r"threat", r"terror",
+            r"amazing", r"incredible", r"unbelievable", r"mind-blowing",
+            r"jaw-dropping", r"once in a lifetime", r"exclusive", r"secret",
+            r"revealed", r"exposed", r"hidden truth", r"you won't believe",
+            r"shocking truth", r"must see", r"must watch", r"viral",
+            r"trending", r"explosive", r"sensational", r"scandal",
+            r"you should", r"you must", r"you need to", r"it's your duty",
+            r"responsibility", r"obligation", r"you owe it to", r"don't let down",
+            r"disappoint", r"failure", r"let everyone down", r"guilt",
+            r"shame", r"ashamed", r"regret", r"missed opportunity",
+            r"outrageous", r"disgusting", r"appalling", r"unacceptable",
+            r"infuriating", r"enraging", r"maddening", r"furious",
+            r"angry", r"rage", r"fury", r"indignation", r"resentment",
+            r"betrayal", r"treachery", r"hypocrisy", r"corruption",
+            r"heartbreaking", r"tragic", r"devastating", r"tear-jerking",
+            r"sob story", r"pitiful", r"miserable", r"depressing",
+            r"hopeless", r"helpless", r"despair", r"grief", r"sorrow",
+            r"mourn", r"loss", r"pain", r"suffering", r"anguish",
+            r"don't miss", r"exclusive offer", r"limited edition",
+            r"only a few left", r"while supplies last", r"free gift",
+            r"no risk", r"guaranteed", r"proven", r"scientifically proven",
+            r"miracle", r"instant results", r"overnight success",
+            r"secret method", r"hidden trick", r"loophole", r"hack",
+            r"cheat code", r"get rich quick", r"lose weight fast",
         ]
         
         self.STEREOTYPE_PATTERNS = [
+            r"women can't", r"men are always", r"women should", r"men should",
+            r"women belong in", r"men belong in", r"women are too", r"men are too",
+            r"women are naturally", r"men are naturally", r"women are better at",
+            r"men are better at", r"women are worse at", r"men are worse at",
+            r"women are emotional", r"men are emotional", r"women are weak",
+            r"men are strong", r"women are submissive", r"men are dominant",
             r"all \w+s are", r"\w+ people always", r"typical \w+ behavior",
-            r"women can't", r"men are always"
+            r"\w+ people can't", r"\w+ people are lazy", r"\w+ people are greedy",
+            r"\w+ people are violent", r"\w+ people are criminals",
+            r"\w+ people are uneducated", r"\w+ people are poor",
+            r"\w+ people are rich", r"\w+ people are cheap",
+            r"\w+ people are aggressive", r"\w+ people are submissive",
+            r"\w+ people are exotic", r"\w+ people are primitive",
+            r"young people are", r"old people are", r"millennials are",
+            r"boomers are", r"gen z are", r"teenagers are", r"kids these days",
+            r"back in my day", r"young people don't", r"old people can't",
+            r"young people are lazy", r"old people are slow",
+            r"young people are entitled", r"old people are out of touch",
+            r"\w+ people are fanatics", r"\w+ people are intolerant",
+            r"\w+ people are extremists", r"\w+ people are terrorists",
+            r"\w+ people are backward", r"\w+ people are superstitious",
+            r"\w+ people are closed-minded", r"\w+ people are oppressive",
+            r"\w+ people are rude", r"\w+ people are arrogant",
+            r"\w+ people are lazy", r"\w+ people are hardworking",
+            r"\w+ people are dishonest", r"\w+ people are corrupt",
+            r"\w+ people are violent", r"\w+ people are peaceful",
+            r"\w+ people are greedy", r"\w+ people are generous",
+            r"all lawyers are", r"all doctors are", r"all teachers are",
+            r"all politicians are", r"all cops are", r"all artists are",
+            r"all engineers are", r"all scientists are", r"all bankers are",
+            r"all journalists are", r"all athletes are", r"all actors are",
+            r"poor people are", r"rich people are", r"homeless people are",
+            r"disabled people are", r"immigrants are", r"refugees are",
+            r"foreigners are", r"locals are", r"city people are",
+            r"country people are", r"educated people are",
+            r"uneducated people are", r"liberals are", r"conservatives are",
         ]
 
     def _setup_generative_ai(self):
@@ -528,9 +739,11 @@ class OptimizedAnalyzer:
         
         return emotional_triggers, stereotypes
 
-    async def fact_check(self, text: str) -> List[Dict]:
+    def fact_check(self, text: str) -> List[Dict]:
         """Perform async fact checking"""
         if not self.fact_check_api_key:
+            logger.warning("Fact check API key is missing")
+            print("Fact check API key is missing")
             return []
 
         cache_key = f"fact_check_{text}"
@@ -538,8 +751,7 @@ class OptimizedAnalyzer:
             cache_entry = self.cache[cache_key]
             if time() - cache_entry['timestamp'] < CACHE_TTL:
                 return cache_entry['data']
-
-        await self._init_session()
+            
         base_url = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
         params = {
             'query': text,
@@ -548,107 +760,70 @@ class OptimizedAnalyzer:
 
         for attempt in range(MAX_RETRIES):
             try:
-                async with self.session.get(base_url, params=params, timeout=TIMEOUT) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        self.cache[cache_key] = {
-                            'data': data.get('claims', []),
-                            'timestamp': time()
-                        }
-                        return data.get('claims', [])
-            except Exception as e:
-                self.logger.error(f"Fact check attempt {attempt + 1} failed: {str(e)}")
-                await asyncio.sleep(1 * (attempt + 1))
+                response = requests.get(base_url, params=params, timeout=TIMEOUT)
+                response.raise_for_status()  
+                data = response.json()
+                self.cache[cache_key] = {
+                    'data': data.get('claims', []),
+                    'timestamp': time.time()
+                }
+                return data.get('claims', [])
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Fact check attempt {attempt + 1} failed: {str(e)}")
+                time.sleep(1 * (attempt + 1))
         
         return []
 
-    async def analyze_text(self, text: str) -> AnalysisResult:
+    def analyze_text(self, text: str) -> AnalysisResult:
         """Perform comprehensive text analysis"""
-        start_time = time.time()  # Fix: Use time.time() instead of time()
-    
+        start_time = time.time()
+
         try:
-            with ThreadPoolExecutor() as executor:
-                loop = asyncio.get_event_loop()
-            
-            # Schedule all ML tasks concurrently
-                sentiment_future = loop.run_in_executor(
-                    executor,
-                    self.sentiment_pipeline,
-                    text
-                )
+            fact_checks = self.fact_check(text)
+            sentiment = self.sentiment_pipeline(text)
+            ner_result = self.ner_pipeline(text)
+            classification = self.zero_shot_classifier(text, ["true claim", "false claim"])
+            emotional_triggers, stereotypes = self.detect_patterns(text)
 
-                ner_future = loop.run_in_executor(
-                    executor,
-                    self.ner_pipeline,
-                    text
-                )
-            
-                classification_future = loop.run_in_executor(
-                    executor,
-                    self.zero_shot_classifier,
-                    text,
-                    ["true claim", "false claim"]
-                )
-            
-                pattern_future = loop.run_in_executor(
-                    executor,
-                    self.detect_patterns,
-                    text
-                )
-            
-                fact_check_future = self.fact_check(text)
-            
-                sentiment, ner_result, classification, patterns, fact_checks = await asyncio.gather(
-                    sentiment_future,
-                    ner_future,
-                    classification_future,
-                    pattern_future,
-                    fact_check_future
-                )
-            
-                emotional_triggers, stereotypes = patterns
-            
-                entities = [{
-                    'text': entity['word'],
-                    'type': entity['entity_group']
-                } for entity in ner_result]
-            
-            # Update knowledge graph
-                self.knowledge_graph.add_fact(text, entities, fact_checks, sentiment[0] if sentiment else {})
-            
-            # Calculate manipulation score
-                manipulation_score = self._compute_manipulation_score(
-                    sentiment,
-                    fact_checks,
-                    emotional_triggers,
-                    stereotypes
-                )
-            
-            # Optional: Generate AI analysis if available
-                generative_analysis = None
-                if self.generative_model:
-                    try:
-                        response = await loop.run_in_executor(
-                            executor,
-                            self.generative_model.generate_content,
-                            f"Analyze the sentiment and credibility of: {text}"
-                        )
-                        generative_analysis = {"analysis": response.text}
-                    except Exception as e:
-                        self.logger.error(f"Generative analysis failed: {e}")
+            entities = [{
+                'text': entity['word'],
+                'type': entity['entity_group']
+            } for entity in ner_result]
 
-                return AnalysisResult(
-                    text=text,
-                    sentiment=sentiment[0] if sentiment else {},
-                    fact_checks=fact_checks,
-                    emotional_triggers=emotional_triggers,
-                    stereotypes=stereotypes,
-                    manipulation_score=manipulation_score,
-                    processing_time=time.time() - start_time,  # Fix: Use time.time() instead of time()
-                    entities=entities,
-                    knowledge_graph=self.knowledge_graph.get_graph_data(),
-                    generative_analysis=generative_analysis
-                )
+            locations = [entity for entity in entities if entity['type'] == 'LOC']
+
+            self.knowledge_graph.add_fact(text, entities, fact_checks, sentiment[0] if sentiment else {})
+
+            manipulation_score = self._compute_manipulation_score(
+                sentiment,
+                fact_checks,
+                emotional_triggers,
+                stereotypes
+            )
+
+            generative_analysis = None
+            if self.generative_model:
+                try:
+                    response = self.generative_model.generate_content(
+                        f"Analyze the sentiment and credibility of: {text}"
+                    )
+                    generative_analysis = {"analysis": response.text}
+                except Exception as e:
+                    self.logger.error(f"Generative analysis failed: {e}")
+
+            return AnalysisResult(
+                text=text,
+                sentiment=sentiment[0] if sentiment else {},
+                fact_checks=fact_checks,
+                emotional_triggers=emotional_triggers,
+                stereotypes=stereotypes,
+                manipulation_score=manipulation_score,
+                processing_time=time.time() - start_time,
+                entities=entities,
+                locations=locations,
+                knowledge_graph=self.knowledge_graph.get_graph_data(),
+                generative_analysis=generative_analysis
+            )
 
         except Exception as e:
             self.logger.error(f"Analysis failed: {str(e)}")
@@ -707,7 +882,6 @@ class VideoAnalyzer:
             avg_score, max_score = self.detector.predict_batch(frames)
             processing_time = time.time() - start_time
             
-            # Record metrics
             self.metrics.record_metric('processing_time', float(processing_time))
             self.metrics.record_metric('frames_processed', float(len(frames)))
             
@@ -762,14 +936,8 @@ class VideoAnalyzer:
                 frames_data['faces_detected'].append(int(faces))
             
             progress_bar.progress(0.7)
-            
-            # Start Spark streaming
             streaming_query = self.spark_processor.start_streaming(self.detector)
-            
-            # Transcribe
             transcription = self.whisper_model.transcribe(video_path)
-            
-            # Send to Kafka
             self.producer.send_video(video_path)
             
             final_score = float(np.mean(frames_data['max_scores']))
@@ -779,6 +947,29 @@ class VideoAnalyzer:
             logger.error(f"Error analyzing video: {e}")
             self.metrics.system_healthy.set(0)
             raise
+
+def create_gis_map():
+    """Create a Folium map with markers for the detected locations."""
+    geolocator = Nominatim(user_agent="geoapiExercises")
+    map_center = [20.5937, 78.9629]  
+    m = folium.Map(location=map_center, zoom_start=5)
+
+    locations = mongo_manager.get_all_locations()
+    
+    for location in locations:
+        try:
+            geo_location = geolocator.geocode(location)
+            if geo_location:
+                folium.Marker(
+                    location=[geo_location.latitude, geo_location.longitude],
+                    popup=location,
+                    icon=folium.Icon(color='red', icon='info-sign')
+                ).add_to(m)
+        except Exception as e:
+            logger.error(f"Error geocoding location {location}: {e}")
+    
+    return m
+
 
 def create_monitoring_dashboard():
     st.subheader("System Monitoring")
@@ -807,39 +998,6 @@ def create_monitoring_dashboard():
             st.metric("System Health", health_status,
                      delta=health_delta,
                      delta_color="normal" if health_status == "Healthy" else "inverse")
-
-        st.subheader("Performance Trends")
-        
-        # Create performance data
-        now = datetime.now()
-        times = [(now - timedelta(minutes=i)).strftime('%H:%M:%S') for i in range(10, -1, -1)]
-        
-        perf_data = pd.DataFrame({
-            'Time': times,
-            'CPU': [float(metrics.get_system_metrics()['cpu_usage']) for _ in times],
-            'Memory': [float(metrics.get_system_metrics()['memory_usage']) for _ in times]
-        })
-        
-        melted_data = pd.melt(
-            perf_data,
-            id_vars=['Time'],
-            value_vars=['CPU', 'Memory'],
-            var_name='Metric',
-            value_name='Value'
-        )
-        melted_data['Value'] = melted_data['Value'].astype(float)
-        
-        perf_chart = alt.Chart(melted_data).mark_line().encode(
-            x=alt.X('Time:T'),
-            y=alt.Y('Value:Q', scale=alt.Scale(domain=[0, 100])),
-            color='Metric:N',
-            tooltip=['Time:T', 'Value:Q', 'Metric:N']
-        ).properties(
-            width=600,
-            height=300
-        )
-        
-        st.altair_chart(perf_chart, use_container_width=True)
         
     except Exception as e:
         logger.error(f"Error creating monitoring dashboard: {e}", exc_info=True)
@@ -967,11 +1125,62 @@ def display_analysis_results(final_score: float, frames_data: Dict):
             mime="text/csv"
         )
 
+def visualize_knowledge_graph_interactive(graph_data):
+    """
+    Visualize the knowledge graph interactively using pyvis.
+    
+    Args:
+        graph_data (dict): The knowledge graph data containing nodes and edges.
+    """
+    net = Network(notebook=True, directed=True, height="750px", width="100%", bgcolor="#ffffff", font_color="#000000")
+    
+    for node_id, node_data in graph_data["nodes"]:
+        label = node_data.get("text", node_id)
+        title = f"Type: {node_data.get('type', 'N/A')}\n"
+        if node_data["type"] == "fact":
+            title += f"Text: {node_data.get('text', 'N/A')}\nSentiment: {node_data.get('sentiment', 'N/A')}"
+        elif node_data["type"] == "verification":
+            title += f"Status: {node_data.get('status', 'N/A')}\nDetails: {node_data.get('details', 'N/A')}"
+        elif node_data["type"] == "entity":
+            title += f"Text: {node_data.get('text', 'N/A')}\nEntity Type: {node_data.get('entity_type', 'N/A')}"
+        net.add_node(node_id, label=label, title=title, color=get_node_color(node_data["type"]))
+    
+    for edge in graph_data["edges"]:
+        source, target, edge_data = edge
+        net.add_edge(source, target, title=edge_data.get("relation", ""), color="gray")
+    
+    net.set_options("""
+    {
+        "physics": {
+            "barnesHut": {
+                "gravitationalConstant": -2000,
+                "centralGravity": 0.3,
+                "springLength": 200,
+                "springConstant": 0.04,
+                "damping": 0.09,
+                "avoidOverlap": 0.1
+            },
+            "minVelocity": 0.75
+        }
+    }
+    """)
+    
+    net.save_graph("knowledge_graph.html")
+    st.components.v1.html(open("knowledge_graph.html", "r").read(), height=800)
+
+def get_node_color(node_type):
+    """Return a color based on the node type."""
+    colors = {
+        "fact": "#ff7f7f",  
+        "verification": "#7f7fff",  
+        "entity": "#7fff7f"  
+    }
+    return colors.get(node_type, "#808080")  
+
 def main():
-    st.title("Advanced Video Analysis Pipeline with Monitoring")
+    st.title("VERISTREAM")
     st.markdown("### Real-time Deepfake Detection & Transcription")
     
-    # Add monitoring dashboard
     create_monitoring_dashboard()
     
     with st.sidebar:
@@ -1003,19 +1212,29 @@ def main():
                 analyzer = VideoAnalyzer()
                 transcription, final_score, frames_data = analyzer.analyze_video(temp_path, progress_bar)
                 
-                # Perform text analysis
                 text_analyzer = OptimizedAnalyzer(use_gpu=True)
-                analysis_result = asyncio.run(text_analyzer.analyze_text(transcription))
+                analysis_result = text_analyzer.analyze_text(transcription)
                 
-                # Display analysis results
                 display_analysis_results(final_score, frames_data)
                 
                 with st.expander("Video Transcription"):
                     st.write(transcription)
+                    target_language = st.selectbox("Translate to", ["English", "Assamese","Bengali", "Gujarati","Hindi", "Kannada","Malayalam","Marathi","Odia (Oriya)","Urdu"])
+    
+                    if target_language != "English":
+                        target_code = LANGUAGE_MAPPING.get(target_language, "en")
+                        translated_text = GoogleTranslator(source='auto', target=target_code).translate(transcription)
+                        st.write(f"Translated to {target_language}:")
+                        st.write(translated_text)
                 
                 with st.expander("Text Analysis Results"):
                     st.write("### Sentiment Analysis")
-                    st.write(analysis_result.sentiment)
+                    if analysis_result.sentiment:
+                        sentiment_label = analysis_result.sentiment["label"]
+                        st.write(f"**Sentiment:** {sentiment_label}")
+                        st.write(f"**Confidence Score:** {analysis_result.sentiment['score']:.4f}")
+                    else:
+                        st.write("Sentiment analysis not available")
                     
                     st.write("### Fact Checks")
                     st.write(analysis_result.fact_checks)
@@ -1033,10 +1252,16 @@ def main():
                     st.write(analysis_result.entities)
                     
                     st.write("### Knowledge Graph")
-                    st.write(analysis_result.knowledge_graph)
+                    visualize_knowledge_graph_interactive(analysis_result.knowledge_graph)
                     
                     st.write("### Generative Analysis")
                     st.write(analysis_result.generative_analysis)
+
+                    st.subheader("Geospatial Visualization of Detected Locations")
+
+                    gis_map = create_gis_map()
+                    folium_static(gis_map)
+                
                 
                 progress_bar.progress(1.0)
                 

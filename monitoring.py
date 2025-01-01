@@ -5,7 +5,7 @@ import time
 from prometheus_client import Counter, Gauge, Histogram, start_http_server, CollectorRegistry
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('monitoring')
 
 class MetricsCollector:
     _instance = None
@@ -59,7 +59,6 @@ class MetricsCollector:
             try:
                 start_http_server(port, registry=MetricsCollector._registry)
             except OSError:
-                # Server already started - ignore
                 pass
 
             self._start_collection()
@@ -73,38 +72,25 @@ class MetricsCollector:
         def collect_metrics():
             while True:
                 try:
-                    # Get system metrics
                     cpu_percent = float(psutil.cpu_percent(interval=None))
-                    vm = psutil.virtual_memory()
-                    memory_percent = float(vm.percent)
-                    disk = psutil.disk_usage('/')
-                    disk_percent = float(disk.percent)
-                    
-                    # Update Prometheus metrics
+                    memory_percent = float(psutil.virtual_memory().percent)
+
                     self.cpu_usage.set(cpu_percent)
                     self.memory_usage.set(memory_percent)
-                    
-                    # Calculate system health
-                    is_healthy = (
-                        cpu_percent < 90.0 and
-                        memory_percent < 90.0 and
-                        disk_percent < 90.0
-                    )
-                    
-                    self.system_healthy.set(1.0 if is_healthy else 0.0)
-                    
-                    time.sleep(15)
-                    
+                    logger.info(f"CPU Usage: {cpu_percent}%, Memory Usage: {memory_percent}%")
+
+                    time.sleep(5)  
                 except Exception as e:
                     logger.error(f"Error collecting metrics: {e}", exc_info=True)
-                    time.sleep(15)  # Still sleep on error to prevent tight loop
-                    
+                    time.sleep(5)
+
         thread = threading.Thread(target=collect_metrics, daemon=True)
         thread.start()
 
+
     def record_metric(self, name: str, value: float):
         try:
-            value = float(value)  # Ensure value is a float
+            value = float(value) 
             if name == 'processing_time':
                 self.processing_time.observe(value)
             elif name == 'frames_processed':
@@ -115,8 +101,8 @@ class MetricsCollector:
     def get_system_metrics(self):
         try:
             return {
-                'cpu_usage': float(psutil.cpu_percent(interval=None)),
-                'memory_usage': float(psutil.virtual_memory().percent),
+                'cpu_usage': float(self.cpu_usage._value.get()),
+                'memory_usage': float(self.memory_usage._value.get()),
                 'system_healthy': float(self.system_healthy._value.get())
             }
         except Exception as e:

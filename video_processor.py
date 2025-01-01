@@ -1,4 +1,3 @@
-#video_processor.py
 import os
 from kafka import KafkaProducer, KafkaConsumer
 import cv2
@@ -12,7 +11,7 @@ class VideoProducer:
         self.producer = KafkaProducer(
             bootstrap_servers=['localhost:29092'],
             value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-            max_request_size=10485760  # 10MB max size
+            max_request_size=10485760  
         )
 
     def video_to_frames(self, video_path, batch_size=30):
