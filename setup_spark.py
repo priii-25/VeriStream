@@ -6,8 +6,9 @@ import tarfile
 import shutil
 
 SPARK_VERSION = "3.5.3"
-SPARK_URL = f"https://archive.apache.org/dist/spark/spark-{SPARK_VERSION}/spark-{SPARK_VERSION}-bin-hadoop3.tgz"
-SPARK_DIR_NAME = f"spark-{SPARK_VERSION}-bin-hadoop3"
+SPARK_URL = "https://archive.apache.org/dist/spark/spark-3.5.3/spark-3.5.3-bin-hadoop3-scala2.13.tgz"
+SPARK_DIR_NAME = f"spark-{SPARK_VERSION}-bin-hadoop3-scala2.13"
+DOWNLOAD_FILE_NAME = f"{SPARK_DIR_NAME}.tar.gz"
 INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
 SPARK_HOME = os.path.join(INSTALL_DIR, SPARK_DIR_NAME)
 
@@ -15,7 +16,7 @@ def download_spark():
     """Download Spark from the specified URL."""
     print(f"Downloading Spark {SPARK_VERSION} from {SPARK_URL}...")
     try:
-        urllib.request.urlretrieve(SPARK_URL, f"spark-{SPARK_VERSION}.tar.gz")
+        urllib.request.urlretrieve(SPARK_URL, DOWNLOAD_FILE_NAME)
         print("Download complete.")
     except Exception as e:
         print(f"Failed to download Spark: {e}")
@@ -25,7 +26,7 @@ def extract_spark():
     """Extract the downloaded Spark archive."""
     print(f"Extracting Spark to {INSTALL_DIR}...")
     try:
-        with tarfile.open(f"spark-{SPARK_VERSION}.tar.gz", "r:gz") as tar:
+        with tarfile.open(DOWNLOAD_FILE_NAME, "r:gz") as tar:
             tar.extractall(path=INSTALL_DIR)
         print("Extraction complete.")
     except Exception as e:
@@ -52,7 +53,7 @@ def cleanup():
     """Clean up temporary files."""
     print("Cleaning up temporary files...")
     try:
-        os.remove(f"spark-{SPARK_VERSION}.tar.gz")
+        os.remove(DOWNLOAD_FILE_NAME)
         print("Cleanup complete.")
     except Exception as e:
         print(f"Failed to clean up: {e}")
