@@ -12,12 +12,17 @@ from datetime import datetime
 import logging
 import threading
 import time
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('spark_video_processor')
 
 class SparkVideoProcessor:
     def __init__(self, app_name="VideoAnalysisPipeline"):
+        root_dir = os.path.dirname(os.path.abspath(__file__))
+        spark_home = os.path.join(root_dir, "spark-3.5.3-bin-hadoop3-scala2.13")
+        os.environ['SPARK_HOME'] = spark_home
+        os.environ['PATH'] = f"{os.path.join(spark_home, 'bin')}:{os.environ['PATH']}"
         self.spark = (SparkSession.builder
                      .appName(app_name)
                      .config("spark.sql.streaming.checkpointLocation", "checkpoint")
@@ -135,3 +140,4 @@ def update_main():
             producer_thread.join()
             
         return query.lastProgress
+    
