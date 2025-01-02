@@ -1,6 +1,6 @@
 # **VeriStream: Misinformation Detection for Media Streams**
 ## **Overview**
-VeriStream is a cutting-edge tool designed to detect and correct misinformation in live broadcasts and media streams. Leveraging AI, machine learning, and distributed systems, VeriStream empowers broadcasters to identify false or misleading information in real-time, enhancing media integrity and transparency.
+VeriStream is a tool designed to detect and verify misinformation in live broadcasts and media streams. Leveraging AI, machine learning, and distributed systems, VeriStream empowers broadcasters to identify false or misleading information in real time, enhancing media integrity and transparency.
 
 ## **Key Features**
 - **Real-Time Knowledge Graphs**: Builds and maintains dynamic entity connections for claim verification.
