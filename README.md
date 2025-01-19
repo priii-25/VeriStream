@@ -70,3 +70,10 @@ Start the program using Streamlit:
 ```bash
 streamlit run app.py
 ```
+
+
+## Demo Video
+
+[![Watch the Demo](https://img.youtube.com/vi/E-LAIFhmeKo/0.jpg)](https://youtu.be/E-LAIFhmeKo)
+
+Click the image to watch the demo on YouTube.
