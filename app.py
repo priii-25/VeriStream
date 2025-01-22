@@ -13,6 +13,7 @@ from utils import create_gis_map, create_monitoring_dashboard, display_analysis_
 from deep_translator import GoogleTranslator
 from kafka.admin import KafkaAdminClient
 from streamlit_folium import folium_static
+import streamlit.components.v1 as components
 import six
 import sys
 if sys.version_info >= (3, 12, 0):
@@ -223,34 +224,66 @@ def analytics_prediction_page():
     try:
         analyzer = OutbreakAnalyzer('misinformation_dataset.csv')
         
-        st.subheader("Prediction Settings")
-        prediction_days = st.slider("Number of days to predict", 7, 90, 30)
-        include_predictions = st.checkbox("Include predictions", value=True)
+        # Create two tabs
+        tab1, tab2 = st.tabs(["Trend Analysis & Predictions", "Misinformation Spread"])
         
-        fig = analyzer.visualize_trends(
-            include_predictions=include_predictions,
-            prediction_days=prediction_days
-        )
-        
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
+        with tab1:
+            st.subheader("Prediction Settings")
+            prediction_days = st.slider("Number of days to predict", 7, 90, 30)
+            include_predictions = st.checkbox("Include predictions", value=True)
             
-            if include_predictions:
-                st.subheader("Detailed Predictions")
-                predictions = predict_range(
-                    start_date=pd.Timestamp.now(),
-                    end_date=pd.Timestamp.now() + timedelta(days=prediction_days)
-                )
+            # Visualization section
+            fig = analyzer.visualize_trends(
+                include_predictions=include_predictions,
+                prediction_days=prediction_days
+            )
+            
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
                 
-                if predictions is not None:
-                    st.write("High-risk outbreaks predicted:")
-                    st.dataframe(predictions.sort_values('outbreak_probability', ascending=False))
-                    st.write(f"Total high-risk outbreaks predicted: {len(predictions)}")
-        else:
-            st.error("Error generating visualizations")
+                # Show predictions table in the same tab
+                if include_predictions:
+                    st.subheader("Detailed Predictions")
+                    predictions = predict_range(
+                        start_date=pd.Timestamp.now(),
+                        end_date=pd.Timestamp.now() + timedelta(days=prediction_days)
+                    )
+                    
+                    if predictions is not None:
+                        col1, col2 = st.columns([2, 1])
+                        with col1:
+                            st.dataframe(
+                                predictions.sort_values('outbreak_probability', ascending=False),
+                                use_container_width=True
+                            )
+                        with col2:
+                            st.metric(
+                                "Total High-Risk Outbreaks", 
+                                len(predictions),
+                                help="Predicted outbreaks with probability > 0.8"
+                            )
+            else:
+                st.error("Error generating visualizations")
+        
+        with tab2:
+            st.subheader("Misinformation Spread Visualization")
+            try:
+                # Read the HTML file
+                html_file_path = "misinformation_map.html"
+                if os.path.exists(html_file_path):
+                    with open(html_file_path, 'r', encoding='utf-8') as f:
+                        html_content = f.read()
+                    # Render the HTML content in full width
+                    components.html(html_content, height=800, scrolling=True)
+                else:
+                    st.error("HTML file not found. Please ensure html exists in the application directory.")
+            except Exception as e:
+                st.error(f"Error loading HTML visualization: {str(e)}")
+                logger.error(f"HTML rendering error: {str(e)}", exc_info=True)
             
     except Exception as e:
         st.error(f"Error in analytics page: {str(e)}")
+        logger.error(f"Analytics error: {str(e)}", exc_info=True)
 
 def main():
     st.sidebar.title("Navigation")

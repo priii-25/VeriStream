@@ -3,6 +3,9 @@ __pycache__/
 *$py.class
 *.so
 .db
+*.db
+*.csv
+*.html
 /factcheck-env
 **/*.csv
 **/*.json
