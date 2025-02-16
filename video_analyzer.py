@@ -1,3 +1,4 @@
+#video_analyzer.py
 import cv2
 import time
 import numpy as np
@@ -88,4 +89,3 @@ class VideoAnalyzer:
             logger.error(f"Error analyzing video: {e}")
             self.metrics.system_healthy.set(0)
             raise
-

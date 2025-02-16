@@ -1,3 +1,4 @@
+#analyzer.py
 import os
 import re
 import time
@@ -320,4 +321,3 @@ class OptimizedAnalyzer:
         except Exception as e:
             self.logger.error(f"Manipulation score computation failed: {e}")
             return 0.5
-

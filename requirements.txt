@@ -37,7 +37,6 @@ websockets
 streamlink
 ffmpeg-python
 youtube-dl
-opencv-python
 geopandas
 folium
 geopy
@@ -46,3 +45,12 @@ googletrans
 httpx
 deep-translator
 langdetect
+
+numpy
+facenet-pytorch
+aiokafka
+prometheus_client
+pymongo
+python-dotenv
+networkx
+google-generativeai

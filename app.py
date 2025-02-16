@@ -1,3 +1,4 @@
+# app.py (Corrected for Streamlit Display)
 import streamlit as st
 import os
 from datetime import timedelta
@@ -14,17 +15,28 @@ from deep_translator import GoogleTranslator
 from kafka.admin import KafkaAdminClient
 from streamlit_folium import folium_static
 import streamlit.components.v1 as components
+from realtime_stream_analyzer import RealtimeStreamAnalyzer
+import asyncio
+import time
+import cv2
 import six
 import sys
+import plotly
+import folium
+import queue
+
+# Ensure compatibility with Kafka client
 if sys.version_info >= (3, 12, 0):
     sys.modules['kafka.vendor.six.moves'] = six.moves
+
 logger = configure_logging()
 
+# ... (OutbreakAnalyzer and predict_range - No Changes) ...
 class OutbreakAnalyzer:
     def __init__(self, data_path):
         self.df = pd.read_csv(data_path)
         self.df['date'] = pd.to_datetime(self.df['date'])
-    
+
     def visualize_trends(self, include_predictions=True, prediction_days=30):
         try:
             fig = make_subplots(
@@ -36,13 +48,13 @@ class OutbreakAnalyzer:
                     'Region-Reason Heatmap'
                 )
             )
-            
+
             df_time = self.df.groupby('date').size().reset_index(name='count')
             fig.add_trace(
                 go.Scatter(x=df_time['date'], y=df_time['count'], name='Historical Outbreaks'),
                 row=1, col=1
             )
-            
+
             if include_predictions:
                 end_date = self.df['date'].max() + timedelta(days=prediction_days)
                 predictions = predict_range(
@@ -56,33 +68,33 @@ class OutbreakAnalyzer:
                                  name='Predicted Outbreaks', line=dict(dash='dash')),
                         row=1, col=1
                     )
-            
+
             region_counts = self.df['region'].value_counts()
             fig.add_trace(
                 go.Bar(x=region_counts.index, y=region_counts.values, name='Outbreaks by Region'),
                 row=1, col=2
             )
-            
+
             reason_counts = self.df['reason'].value_counts()
             fig.add_trace(
                 go.Bar(x=reason_counts.index, y=reason_counts.values, name='Outbreaks by Reason'),
                 row=2, col=1
             )
-            
+
             heatmap_data = pd.crosstab(self.df['region'], self.df['reason'])
             fig.add_trace(
                 go.Heatmap(z=heatmap_data.values, x=heatmap_data.columns,
                           y=heatmap_data.index, name='Region-Reason Distribution'),
                 row=2, col=2
             )
-            
+
             fig.update_layout(
                 height=800,
                 width=1200,
                 title_text="Outbreak Analysis Dashboard",
                 showlegend=True
             )
-            
+
             return fig
         except Exception as e:
             print(f"Error creating visualization: {str(e)}")
@@ -97,11 +109,11 @@ def predict_range(start_date, end_date, model_path='outbreak_model.joblib'):
         feature_columns = model_components['feature_columns']
         regions = model_components['regions']
         reasons = model_components['reasons']
-        
+
         start_date = pd.to_datetime(start_date)
         end_date = pd.to_datetime(end_date)
         dates = pd.date_range(start=start_date, end=end_date)
-        
+
         prediction_data = []
         for date in dates:
             for region in regions:
@@ -125,12 +137,12 @@ def predict_range(start_date, end_date, model_path='outbreak_model.joblib'):
                         'reason_30d_count': 0,
                         'reason_90d_count': 0
                     })
-        
+
         prediction_df = pd.DataFrame(prediction_data)
         predictions = model.predict_proba(prediction_df[feature_columns])
         prediction_df['outbreak_probability'] = predictions.max(axis=1)
         high_risk_outbreaks = prediction_df[prediction_df['outbreak_probability'] > 0.8]
-        
+
         return high_risk_outbreaks[['date', 'region', 'reason', 'outbreak_probability']]
     except Exception as e:
         print(f"Error during prediction: {str(e)}")
@@ -139,9 +151,9 @@ def predict_range(start_date, end_date, model_path='outbreak_model.joblib'):
 def video_analysis_page():
     st.title("VERISTREAM")
     st.markdown("### Real-time Deepfake Detection & Transcription")
-    
+
     create_monitoring_dashboard()
-    
+
     with st.sidebar:
         st.title("System Status")
         if st.button("Check Kafka Topics"):
@@ -152,29 +164,29 @@ def video_analysis_page():
             except Exception as e:
                 st.error(f"Error checking topics: {e}")
                 logger.error(f"Kafka error: {e}")
-    
+
     uploaded_file = st.file_uploader("Upload Video for Analysis", type=['mp4', 'avi', 'mov'])
-    
+
     if uploaded_file:
         temp_path = f"temp_{uploaded_file.name}"
         try:
             with open(temp_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
-            
+
             video_file = open(temp_path, "rb")
             st.video(video_file)
-            
+
             progress_bar = st.progress(0)
             st.write("Analyzing video...")
-            
+
             analyzer = VideoAnalyzer()
             transcription, final_score, frames_data = analyzer.analyze_video(temp_path, progress_bar)
-            
+
             text_analyzer = OptimizedAnalyzer(use_gpu=True)
             analysis_result = text_analyzer.analyze_text(transcription)
-            
+
             display_analysis_results(final_score, frames_data)
-            
+
             with st.expander("Video Transcription"):
                 st.write(transcription)
                 target_language = st.selectbox(
@@ -182,13 +194,13 @@ def video_analysis_page():
                     ["English", "Assamese", "Bengali", "Gujarati", "Hindi", "Kannada",
                      "Malayalam", "Marathi", "Odia (Oriya)", "Urdu"]
                 )
-                
+
                 if target_language != "English":
                     target_code = LANGUAGE_MAPPING.get(target_language, "en")
                     translated_text = GoogleTranslator(source='auto', target=target_code).translate(transcription)
                     st.write(f"Translated to {target_language}:")
                     st.write(translated_text)
-            
+
             with st.expander("Text Analysis Results"):
                 st.write("### Sentiment Analysis")
                 if analysis_result.sentiment:
@@ -196,21 +208,21 @@ def video_analysis_page():
                     st.write(f"**Confidence Score:** {analysis_result.sentiment['score']:.4f}")
                 else:
                     st.write("Sentiment analysis not available")
-                
+
                 for section in ["Fact Checks", "Emotional Triggers", "Stereotypes",
                               "Manipulation Score", "Entities", "Generative Analysis"]:
                     st.write(f"### {section}")
                     st.write(getattr(analysis_result, section.lower().replace(" ", "_")))
-                
+
                 st.write("### Knowledge Graph")
                 visualize_knowledge_graph_interactive(analysis_result.knowledge_graph)
-                
+
                 st.subheader("Geospatial Visualization of Detected Locations")
                 gis_map = create_gis_map()
                 folium_static(gis_map)
-            
+
             progress_bar.progress(1.0)
-            
+
         except Exception as e:
             st.error(f"Error processing video: {str(e)}")
             logger.error(f"Processing error: {str(e)}", exc_info=True)
@@ -220,27 +232,27 @@ def video_analysis_page():
 
 def analytics_prediction_page():
     st.title("Analytics & Predictions")
-    
+
     try:
         analyzer = OutbreakAnalyzer('misinformation_dataset.csv')
-        
+
         # Create two tabs
         tab1, tab2 = st.tabs(["Trend Analysis & Predictions", "Misinformation Spread"])
-        
+
         with tab1:
             st.subheader("Prediction Settings")
             prediction_days = st.slider("Number of days to predict", 7, 90, 30)
             include_predictions = st.checkbox("Include predictions", value=True)
-            
+
             # Visualization section
             fig = analyzer.visualize_trends(
                 include_predictions=include_predictions,
                 prediction_days=prediction_days
             )
-            
+
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
-                
+
                 # Show predictions table in the same tab
                 if include_predictions:
                     st.subheader("Detailed Predictions")
@@ -248,7 +260,7 @@ def analytics_prediction_page():
                         start_date=pd.Timestamp.now(),
                         end_date=pd.Timestamp.now() + timedelta(days=prediction_days)
                     )
-                    
+
                     if predictions is not None:
                         col1, col2 = st.columns([2, 1])
                         with col1:
@@ -258,13 +270,13 @@ def analytics_prediction_page():
                             )
                         with col2:
                             st.metric(
-                                "Total High-Risk Outbreaks", 
+                                "Total High-Risk Outbreaks",
                                 len(predictions),
                                 help="Predicted outbreaks with probability > 0.8"
                             )
             else:
                 st.error("Error generating visualizations")
-        
+
         with tab2:
             st.subheader("Misinformation Spread Visualization")
             try:
@@ -280,19 +292,98 @@ def analytics_prediction_page():
             except Exception as e:
                 st.error(f"Error loading HTML visualization: {str(e)}")
                 logger.error(f"HTML rendering error: {str(e)}", exc_info=True)
-            
+
     except Exception as e:
         st.error(f"Error in analytics page: {str(e)}")
         logger.error(f"Analytics error: {str(e)}", exc_info=True)
 
+def realtime_analysis_page():
+    st.title("Real-time Stream Analysis")
+
+    stream_url = st.text_input("Enter Stream URL (YouTube, Twitch, etc.):", key="stream_url")
+
+    col1, col2, col3 = st.columns(3)  # Add a third column
+    with col1:
+        start_button = st.button("Start Analysis")
+    with col2:
+        stop_button = st.button("Stop Analysis")
+    with col3:
+        profile_button = st.button("Profile Analysis")  # Profiling button
+
+
+    if 'analyzer' not in st.session_state:
+        st.session_state.analyzer = None
+    if 'frame_placeholder' not in st.session_state:
+        st.session_state.frame_placeholder = st.empty()
+    if 'display_frame' not in st.session_state:
+        st.session_state.display_frame = None
+    if 'metrics' not in st.session_state:
+        st.session_state.metrics = {'score': 0.0, 'processing_time': 0.0}
+
+    frame_container = st.empty()
+
+    if start_button:
+        if st.session_state.analyzer and st.session_state.analyzer.is_running:
+            st.warning("Analysis is already running. Stop the current analysis before starting a new one.")
+        else:
+            st.session_state.analyzer = RealtimeStreamAnalyzer()
+            asyncio.run(st.session_state.analyzer.start_analysis(stream_url))
+
+    if stop_button:
+        if st.session_state.analyzer:
+            st.session_state.analyzer.stop_analysis()
+            frame_container.empty()
+            st.session_state.metrics = {'score': 0.0, 'processing_time': 0.0}
+
+    if profile_button:  # Handle profiling button
+        if st.session_state.analyzer and st.session_state.analyzer.is_running:
+            st.warning("Stop the current analysis before profiling.")
+        else:
+          st.session_state.analyzer = RealtimeStreamAnalyzer()
+          st.session_state.analyzer.start_profiling()
+          asyncio.run(st.session_state.analyzer.start_analysis(stream_url)) # Start with profiling
+          st.session_state.analyzer.stop_analysis() # Stop immediately
+          #st.session_state.analyzer.stop_profiling()
+
+
+
+    if st.session_state.analyzer and st.session_state.analyzer.is_running:
+        try:
+            try:
+                result = st.session_state.analyzer.result_queue.get(timeout=0.1)  # Add timeout
+                if result and 'frame' in result:
+                    frame = result['frame']
+                    if frame is not None and frame.size > 0:
+                        frame_container.image(frame, channels="RGB", use_column_width=True)
+                        st.session_state.display_frame = frame
+
+                        if 'score' in result:
+                            st.session_state.metrics['score'] = result['score']
+                        if 'processing_time' in result:
+                            st.session_state.metrics['processing_time'] = result['processing_time']
+            except queue.Empty:
+                if st.session_state.display_frame is not None:
+                     frame_container.image(st.session_state.display_frame, channels="RGB", use_column_width=True)
+
+        except Exception as e:
+            st.error(f"Error displaying frame: {e}")
+
+    metrics_col1, metrics_col2 = st.columns(2)
+    with metrics_col1:
+        st.metric("Deepfake Score", f"{st.session_state.metrics['score']:.2%}")
+    with metrics_col2:
+        st.metric("Processing Time (s)", f"{st.session_state.metrics['processing_time']:.3f}")
+
 def main():
     st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Go to", ["Video Analysis", "Analytics & Predictions"])
-    
+    page = st.sidebar.radio("Go to", ["Video Analysis", "Analytics & Predictions", "Real-time Analysis"])
+
     if page == "Video Analysis":
         video_analysis_page()
-    else:
+    elif page == "Analytics & Predictions":
         analytics_prediction_page()
+    elif page == "Real-time Analysis":
+        realtime_analysis_page()
 
 if __name__ == "__main__":
     main()

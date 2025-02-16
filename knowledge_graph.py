@@ -1,3 +1,4 @@
+#knowledge_graph.py
 import networkx as nx
 import matplotlib.pyplot as plt
 from pyvis.network import Network
@@ -322,4 +323,3 @@ class KnowledgeGraphManager:
             'static': static_output,
             'combined': combined_output
         }
-

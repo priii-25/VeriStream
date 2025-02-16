@@ -1,3 +1,4 @@
+#optimized_deepfake_detector.py
 import torch
 import torch.nn as nn
 from efficientnet_pytorch import EfficientNet
@@ -51,32 +52,37 @@ class OptimizedDeepfakeDetector(nn.Module):
         scores = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
         return scores.tolist()
 
-    def predict_batch(self, frames, batch_size=8):
-        all_scores = []
-        face_batches = []
-        current_batch = []
-        
-        def process_frame(frame):
-            boxes, _ = self.face_detector.detect(frame)
-            if boxes is None:
-                return []
-            faces = []
-            for box in boxes.astype(int):
-                face = frame[box[1]:box[3], box[0]:box[2]]
-                if face.size != 0:
-                    face = cv2.resize(face, (224, 224))
-                    face = torch.from_numpy(face).permute(2, 0, 1).float() / 255.0
-                    faces.append(face)
-            return faces
+    # In optimized_deepfake_detector.py
+    def predict_batch(self, frames):
+        per_frame_scores = []
+        all_faces = []
+        frame_indices = []
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            processed_faces = list(executor.map(process_frame, frames))
-            
-        all_faces = [face for faces in processed_faces for face in faces]
-        for i in range(0, len(all_faces), batch_size):
-            batch = all_faces[i:i + batch_size]
-            if batch:
-                scores = self.process_batch(batch)
-                all_scores.extend(scores)
-                
-        return np.mean(all_scores) if all_scores else 0.0, max(all_scores) if all_scores else 0.0
+        for frame_idx, frame in enumerate(frames):
+            boxes, _ = self.face_detector.detect(frame)
+            if boxes is not None:
+                faces = []
+                for box in boxes.astype(int):
+                    face = frame[box[1]:box[3], box[0]:box[2]]
+                    if face.size != 0:
+                        face = cv2.resize(face, (224, 224))
+                        face = torch.from_numpy(face).permute(2, 0, 1).float() / 255.0
+                        all_faces.append(face)
+                        frame_indices.append(frame_idx)
+
+    # Process all faces in batches
+        per_face_scores = []
+        for i in range(0, len(all_faces), self.batch_size):
+            batch = all_faces[i:i + self.batch_size]
+            scores = self.process_batch(batch)
+            per_face_scores.extend(scores)
+
+    # Aggregate max score per frame
+        per_frame_scores = [0.0] * len(frames)
+        for idx, face_score in enumerate(per_face_scores):
+            frame_idx = frame_indices[idx]
+            if face_score > per_frame_scores[frame_idx]:
+                per_frame_scores[frame_idx] = face_score
+
+        return per_frame_scores    
+    
