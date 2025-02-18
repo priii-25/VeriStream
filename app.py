@@ -1,4 +1,17 @@
-# app.py (Corrected for Streamlit Display)
+import cv2
+import numpy as np
+import time
+import subprocess
+import asyncio
+import logging
+from models import load_models  # Assuming this loads your models
+from analyzer import OptimizedAnalyzer
+from monitoring import MetricsCollector
+import streamlink
+import queue
+import threading
+import cProfile
+import pstats
 import streamlit as st
 import os
 from datetime import timedelta
@@ -8,14 +21,14 @@ from plotly.subplots import make_subplots
 import joblib
 from config import LANGUAGE_MAPPING
 from logging_config import configure_logging
-from analyzer import OptimizedAnalyzer
+#from analyzer import OptimizedAnalyzer # Already imported
 from video_analyzer import VideoAnalyzer
 from utils import create_gis_map, create_monitoring_dashboard, display_analysis_results, visualize_knowledge_graph_interactive
 from deep_translator import GoogleTranslator
 from kafka.admin import KafkaAdminClient
 from streamlit_folium import folium_static
 import streamlit.components.v1 as components
-from realtime_stream_analyzer import RealtimeStreamAnalyzer
+#from realtime_stream_analyzer import RealtimeStreamAnalyzer # Will define below
 import asyncio
 import time
 import cv2
@@ -25,13 +38,215 @@ import plotly
 import folium
 import queue
 
-# Ensure compatibility with Kafka client
+
+# Ensure compatibility with Kafka client (Good practice, keep this)
 if sys.version_info >= (3, 12, 0):
     sys.modules['kafka.vendor.six.moves'] = six.moves
 
-logger = configure_logging()
 
-# ... (OutbreakAnalyzer and predict_range - No Changes) ...
+logger = configure_logging()  # Assuming this sets up logging
+metrics = MetricsCollector()  # Assuming this is for performance monitoring
+
+class RealtimeStreamAnalyzer: # REPLACED with the class from the simplified script
+    def __init__(self):
+        self.is_running = False
+        self.stream_process = None
+        self.frame_queue = queue.Queue(maxsize=1000) # Increased queue size for buffering
+        self.ffmpeg_thread = None
+        self.frame_buffer = [] # Buffer to store frames
+
+    def get_stream_resolution(self, stream_url):
+        """Gets the resolution of a video stream using ffprobe."""
+        try:
+            command = [
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height',
+                '-of', 'csv=s=x:p=0',
+                stream_url
+            ]
+            result = subprocess.check_output(command).decode('utf-8').strip()
+            parts = result.split('x')
+            valid_parts = [part.strip() for part in parts if part.strip().isdigit()]
+
+            if len(valid_parts) == 2:
+                width, height = map(int, valid_parts)
+                logger.info(f"Detected stream resolution: {width}x{height}")
+                return width, height
+            else:
+                logger.warning(f"Unexpected ffprobe output: {result}. Using default resolution.")
+                return 640, 480
+
+        except Exception as e:
+            logger.error(f"Error getting stream resolution: {e}", exc_info=True)
+            return 640, 480
+
+
+    async def _read_stream_ffmpeg(self, stream_url, buffer_duration=30):
+        """Improved stream reading with better buffering and error handling."""
+        output_width = 640  # Increased resolution
+        output_height = 360
+        output_fps = 10     # Increased FPS
+        frame_size = output_width * output_height * 3
+        buffer_end_time = time.time() + buffer_duration
+
+        command = [
+        'ffmpeg',
+        '-i', stream_url,
+        '-vf', f'scale={output_width}:{output_height}',
+        '-r', str(output_fps),
+        '-f', 'rawvideo',
+        '-pix_fmt', 'rgb24',
+        '-an',
+        '-'
+    ]
+
+        try:
+            self.stream_process = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8
+            )
+            await asyncio.sleep(2)
+            logger.info(f"FFmpeg process started with PID: {self.stream_process.pid}")
+
+            def log_ffmpeg_stderr(stderr_pipe):
+                while self.is_running and self.stream_process:
+                    if stderr_pipe.closed: # <--- Add this check
+                        break
+                    line = stderr_pipe.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        logger.error(f"FFmpeg Stderr: {line}")
+                    elif self.stream_process.poll() is not None:
+                        break
+
+            stderr_thread = threading.Thread(target=log_ffmpeg_stderr, args=(self.stream_process.stderr,), daemon=True)
+            stderr_thread.start()
+
+            self.frame_buffer = [] # Clear buffer before starting
+
+            while self.is_running and self.stream_process and time.time() < buffer_end_time: # Buffer for duration
+                try:
+                    start_read_time = time.time() # <--- Add start time
+                    raw_frame = self.stream_process.stdout.read(frame_size)
+                    read_duration = time.time() - start_read_time # <--- Calculate read duration
+
+                    logger.info(f"Frame queue size: {self.frame_queue.qsize()}, Frame buffer size: {len(self.frame_buffer)}, FFmpeg read time: {read_duration:.4f}s") # <--- ADD THIS LOGGING
+
+
+                    if not raw_frame:
+                        if self.stream_process.poll() is not None:
+                            logger.warning("No frame data and FFmpeg process ended.")
+                            break
+                        else:
+                            continue
+
+                    if len(raw_frame) != frame_size:
+                        continue
+
+                    frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((output_height, output_width, 3))
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    if frame.size == 0:
+                        continue
+                    if np.any(np.isnan(frame)):
+                        continue
+
+                    self.frame_buffer.append(frame) # Buffer frame
+
+                except Exception as e:
+                    logger.error(f"Error reading frame: {e}", exc_info=True)
+                    break
+
+        except Exception as e:
+            logger.error(f"FFmpeg process encountered an error: {e}")
+
+        finally:
+            if self.stream_process:
+                self.stream_process.stdout.close()
+                if self.stream_process.stderr:
+                    self.stream_process.stderr.close()
+                logger.info("FFmpeg process cleaned up.")
+            self.is_running = False # Stop after buffering is done or error occurs
+
+
+    async def start_analysis(self, stream_url):
+        """Start buffering."""
+        self.is_running = True
+        self.frame_buffer = [] # Ensure buffer is clear at start
+
+        try:
+            streams = streamlink.streams(stream_url)
+            if not streams:
+                raise ValueError(f"No streams found for URL: {stream_url}")
+
+            stream = streams.get("720p")
+            if stream is None:
+                stream = streams.get("480p")
+            if stream is None:
+                stream = streams.get("360p")
+            if stream is None:
+                stream = streams.get("best")
+
+            actual_stream_url = stream.url
+            logger.info(f"Resolved stream URL: {actual_stream_url}")
+
+            self.ffmpeg_thread = asyncio.create_task(self._read_stream_ffmpeg(actual_stream_url))
+
+        except streamlink.StreamlinkError as e:
+            logger.error(f"Streamlink error: {e}")
+            st.error(f"Streamlink error: {e}")
+            self.is_running = False
+        except ValueError as e:
+            logger.error(f"Value error: {e}")
+            st.error(f"Value error: {e}")
+            self.is_running = False
+        except Exception as e:
+            logger.error(f"An unexpected error occurred: {e}")
+            st.error(f"An unexpected error occurred: {e}")
+            self.is_running = False
+
+
+    def stop_analysis(self):
+        """Stop analysis and clean up."""
+        self.is_running = False
+
+        if self.stream_process:
+            try:
+                self.stream_process.send_signal(subprocess.signal.SIGINT)
+                self.stream_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning("FFmpeg process did not terminate gracefully.  Forcing termination.")
+                self.stream_process.kill()
+            finally:
+                self.stream_process = None
+
+        if self.ffmpeg_thread and not self.ffmpeg_thread.done():
+             self.ffmpeg_thread.cancel()
+             try:
+                asyncio.run(self.ffmpeg_thread)
+             except asyncio.CancelledError:
+                pass
+
+        self.frame_buffer = [] # Clear buffer on stop
+        logger.info("Real-time analysis stopped.")
+
+
+    def start_profiling(self): # Keep this, but its functionality is now different in real-time page
+        """Start profiling."""
+        self.profiling = True
+        print("Profiling started. Run analysis, then stop to see results.")
+
+    def stop_profiling(self): # Keep this, but its functionality is now different in real-time page
+        """Stop profiling and print results."""
+        self.profiling = False
+        if self.profiler:
+             self.profiler.disable()
+             stats = pstats.Stats(self.profiler)
+             stats.sort_stats(pstats.SortKey.TIME)
+             stats.print_stats(20)
+
+
+# app.py (Corrected for Streamlit Display)
+
 class OutbreakAnalyzer:
     def __init__(self, data_path):
         self.df = pd.read_csv(data_path)
@@ -302,77 +517,107 @@ def realtime_analysis_page():
 
     stream_url = st.text_input("Enter Stream URL (YouTube, Twitch, etc.):", key="stream_url")
 
-    col1, col2, col3 = st.columns(3)  # Add a third column
+    col1, col2, col3 = st.columns(3)
     with col1:
-        start_button = st.button("Start Analysis")
+        start_button = st.button("Start Stream (10 seconds)")
     with col2:
-        stop_button = st.button("Stop Analysis")
+        stop_button = st.button("Stop Stream")
     with col3:
-        profile_button = st.button("Profile Analysis")  # Profiling button
-
+        profile_button = st.button("Profile Analysis")
 
     if 'analyzer' not in st.session_state:
-        st.session_state.analyzer = None
-    if 'frame_placeholder' not in st.session_state:
-        st.session_state.frame_placeholder = st.empty()
-    if 'display_frame' not in st.session_state:
-        st.session_state.display_frame = None
-    if 'metrics' not in st.session_state:
-        st.session_state.metrics = {'score': 0.0, 'processing_time': 0.0}
+        st.session_state.analyzer = RealtimeStreamAnalyzer()
 
     frame_container = st.empty()
+    
+    def start_streaming_task(url):
+        async def stream_and_display():
+            try:
+                # Start buffering
+                st.write("Starting stream buffering...")
+                await st.session_state.analyzer.start_analysis(url)
+                
+                # Wait for buffer to fill
+                buffer_wait_time = 0
+                while len(st.session_state.analyzer.frame_buffer) < 10 and buffer_wait_time < 10:
+                    st.write(f"Buffering... ({len(st.session_state.analyzer.frame_buffer)} frames)")
+                    await asyncio.sleep(1)
+                    buffer_wait_time += 1
+                
+                total_frames = len(st.session_state.analyzer.frame_buffer)
+                st.write(f"Buffer filled with {total_frames} frames")
+                
+                if total_frames > 0:
+                    # Create progress tracking
+                    progress = st.progress(0)
+                    frames_displayed = 0
+                    start_time = time.time()
+                    
+                    # Display frames
+                    for i in range(total_frames):
+                        if not st.session_state.analyzer.is_running:
+                            break
+                            
+                        frame = st.session_state.analyzer.frame_buffer[i]
+                        if frame is not None and frame.size > 0:
+                            # Update display
+                            frame_container.image(frame, channels="RGB", use_container_width=True)
+                            frames_displayed += 1
+                            
+                            # Update progress
+                            progress.progress(i / total_frames)
+                            
+                            # Debug output for every 10th frame
+                            if frames_displayed % 10 == 0:
+                                st.write(f"Displayed frame {frames_displayed}/{total_frames}")
+                            
+                            # Control frame rate
+                            await asyncio.sleep(0.1)  # 10 FPS
+                    
+                    # Final statistics
+                    elapsed_time = time.time() - start_time
+                    progress.progress(1.0)
+                    st.write(f"Display finished: {frames_displayed} frames shown in {elapsed_time:.2f} seconds")
+                    st.write(f"Effective frame rate: {frames_displayed/elapsed_time:.2f} FPS")
+                else:
+                    st.error("No frames were buffered!")
+                    
+            except Exception as e:
+                st.error(f"Error in streaming: {str(e)}")
+                logger.error(f"Streaming error: {str(e)}", exc_info=True)
+            finally:
+                st.session_state.analyzer.stop_analysis()
+
+        # Run the async function in the current event loop
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        loop.run_until_complete(stream_and_display())
 
     if start_button:
-        if st.session_state.analyzer and st.session_state.analyzer.is_running:
-            st.warning("Analysis is already running. Stop the current analysis before starting a new one.")
+        if st.session_state.analyzer.is_running:
+            st.warning("Stream is already running/buffering.")
         else:
-            st.session_state.analyzer = RealtimeStreamAnalyzer()
-            asyncio.run(st.session_state.analyzer.start_analysis(stream_url))
+            start_streaming_task(stream_url)
 
     if stop_button:
         if st.session_state.analyzer:
             st.session_state.analyzer.stop_analysis()
             frame_container.empty()
-            st.session_state.metrics = {'score': 0.0, 'processing_time': 0.0}
 
-    if profile_button:  # Handle profiling button
+    if profile_button:
+        st.warning("Profiling in Real-time Stream page will only profile the buffering stage.")
         if st.session_state.analyzer and st.session_state.analyzer.is_running:
             st.warning("Stop the current analysis before profiling.")
         else:
-          st.session_state.analyzer = RealtimeStreamAnalyzer()
-          st.session_state.analyzer.start_profiling()
-          asyncio.run(st.session_state.analyzer.start_analysis(stream_url)) # Start with profiling
-          st.session_state.analyzer.stop_analysis() # Stop immediately
-          #st.session_state.analyzer.stop_profiling()
+            st.session_state.analyzer.start_profiling()
+            start_streaming_task(stream_url)
+            st.session_state.analyzer.stop_analysis()
+            st.session_state.analyzer.stop_profiling()
 
-
-
-    if st.session_state.analyzer and st.session_state.analyzer.is_running:
-        try:
-            try:
-                result = st.session_state.analyzer.result_queue.get(timeout=0.1)  # Add timeout
-                if result and 'frame' in result:
-                    frame = result['frame']
-                    if frame is not None and frame.size > 0:
-                        frame_container.image(frame, channels="RGB", use_column_width=True)
-                        st.session_state.display_frame = frame
-
-                        if 'score' in result:
-                            st.session_state.metrics['score'] = result['score']
-                        if 'processing_time' in result:
-                            st.session_state.metrics['processing_time'] = result['processing_time']
-            except queue.Empty:
-                if st.session_state.display_frame is not None:
-                     frame_container.image(st.session_state.display_frame, channels="RGB", use_column_width=True)
-
-        except Exception as e:
-            st.error(f"Error displaying frame: {e}")
-
-    metrics_col1, metrics_col2 = st.columns(2)
-    with metrics_col1:
-        st.metric("Deepfake Score", f"{st.session_state.metrics['score']:.2%}")
-    with metrics_col2:
-        st.metric("Processing Time (s)", f"{st.session_state.metrics['processing_time']:.3f}")
 
 def main():
     st.sidebar.title("Navigation")
