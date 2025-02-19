@@ -4,12 +4,8 @@ __pycache__/
 *.so
 .db
 *.db
-*.csv
-*.html
 /factcheck-env
-**/*.csv
 **/*.json
-*.html
 .Python
 build/
 develop-eggs/

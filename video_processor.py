@@ -1,4 +1,3 @@
-#video_processor.py
 import os
 from kafka import KafkaProducer, KafkaConsumer
 import cv2

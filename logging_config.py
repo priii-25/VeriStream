@@ -1,4 +1,3 @@
-#logging_config.py
 import logging
 from config import LOGGING_LEVEL, LOGGING_FORMAT, LOGGING_HANDLERS
 
