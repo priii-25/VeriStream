@@ -64,6 +64,9 @@ Create a .env file in the project root directory
 ```bash
 FACT_CHECK_API_KEY=your_fact_check_api_key_here
 GOOGLE_API_KEY=your_google_api_key_here
+MONGODB_URI=your_mongodb_uri_here
+MONGODB_DB_NAME=your_mongodb_db_name_here
+MONGODB_COLLECTION_NAME=your_mongodb_collection_name_here
 ```
 7. Run the Application
 Start the program using Streamlit:
