@@ -1,4 +1,3 @@
-#mongodb_manager.py
 from pymongo import MongoClient
 from datetime import datetime
 import logging

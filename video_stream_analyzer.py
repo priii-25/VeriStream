@@ -1,4 +1,3 @@
-# video_stream_analyzer.py
 import cv2
 import numpy as np
 import subprocess
@@ -11,6 +10,7 @@ from spark_video_processor import SparkVideoProcessor
 from utils import display_realtime_results
 import streamlit as st
 import time
+import gi
 logger = logging.getLogger('veristream')
 
 class StreamAnalyzer:
@@ -61,8 +61,6 @@ class StreamAnalyzer:
             videoconvert !
             appsink
         """
-        
-        import gi
         gi.require_version('Gst', '1.0')
         from gi.repository import Gst
 
@@ -93,15 +91,9 @@ class StreamAnalyzer:
             start_time = time.time()
             avg_score, max_score = self.detector.predict_batch([frame])
             processing_time = time.time() - start_time
-            
-            # Send to Spark for distributed processing
             self.spark_processor.process_frame(frame)
-            
-            # Update metrics
             self.metrics.record_metric('processing_time', processing_time)
             self.metrics.record_metric('frames_processed', 1)
-            
-            # Update UI
             st.session_state.latest_frame = frame
             st.session_state.analysis_metrics = {
                 'latest_score': max_score,
