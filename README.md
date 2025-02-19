@@ -84,5 +84,5 @@ streamlit run app.py
 
 ## Demo Video
 
-[![Demo Video](https://img.youtube.com/vi/E-LAIFhmeKo/0.jpg)](https://youtu.be/E-LAIFhmeKo)
+[![Demo Video](https://img.youtube.com/vi/R8k3lyrDKZ4/0.jpg)](https://youtu.be/R8k3lyrDKZ4)
 
