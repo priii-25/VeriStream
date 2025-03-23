@@ -59,7 +59,13 @@ pip install -r requirements.txt
 python setup_spark.py
 ```
 6. Configure API Keys
-Obtain API keys for: Google Fact Check API & Google Generative AI API.
+For Demo purposes refer to .env.example
+```bash
+FACT_CHECK_API_KEY = YOUR_FACT_CHECK_API_KEY
+GOOGLE_API_KEY = YOUR_GOOGLE_API_KEY
+DEMO_MODE=True
+```
+OR
 Create a .env file in the project root directory
 ```bash
 FACT_CHECK_API_KEY=your_fact_check_api_key_here
@@ -68,6 +74,7 @@ MONGODB_URI=your_mongodb_uri_here
 MONGODB_DB_NAME=your_mongodb_db_name_here
 MONGODB_COLLECTION_NAME=your_mongodb_collection_name_here
 ```
+
 7. Run the Application
 Start the program using Streamlit:
 ```bash
@@ -77,5 +84,5 @@ streamlit run app.py
 
 ## Demo Video
 
-[![Demo Video](https://img.youtube.com/vi/E-LAIFhmeKo/0.jpg)](https://youtu.be/E-LAIFhmeKo)
+[![Demo Video](https://img.youtube.com/vi/R8k3lyrDKZ4/3.jpg)](https://youtu.be/R8k3lyrDKZ4)
 

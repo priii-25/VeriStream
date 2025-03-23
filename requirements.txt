@@ -45,7 +45,7 @@ googletrans
 httpx
 deep-translator
 langdetect
-
+sounddevice
 numpy
 facenet-pytorch
 aiokafka
