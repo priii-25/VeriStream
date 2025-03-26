@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+kafka-python
+whisper
+torch
+efficientnet-pytorch
+facenet-pytorch
+transformers
+aiohttp
+numpy
+opencv-python-headless
+prometheus_client
+psutil
+pyspark
+python-multipart
+sse-starlette
