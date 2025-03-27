@@ -14,3 +14,7 @@ psutil
 pyspark
 python-multipart
 sse-starlette
+spacy 
+transformers 
+textblob 
+requests

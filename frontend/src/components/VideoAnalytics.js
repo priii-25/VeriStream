@@ -100,22 +100,29 @@ const VideoAnalytics = () => {
   };
 
   const handleTranslate = async () => {
-    if (!file) return;
+    if (!analysisResult || !analysisResult.transcription) {
+      setError('No transcription available to translate.');
+      return;
+    }
 
     setLoading(true);
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('language', language);
+    setError(null);
 
     try {
       const response = await axios.post(
         'http://127.0.0.1:5000/api/video/translate',
-        formData,
-        { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 30000 }
+        {
+          transcription: analysisResult.transcription,
+          language: language,
+        },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 30000,
+        }
       );
       setTranslation(response.data.translation);
     } catch (err) {
-      setError(err.response?.data?.error || 'Translation failed.');
+      setError(err.response?.data?.detail || 'Translation failed.');
     } finally {
       setLoading(false);
     }
@@ -148,28 +155,49 @@ const VideoAnalytics = () => {
 
   const summaryMetrics = calculateSummaryMetrics();
 
-  const lineChartData = analysisResult?.frames_data ? {
-    labels: analysisResult.frames_data.timestamps.map((t) => t.toFixed(2)),
-    datasets: [{ label: 'Deepfake Score', data: analysisResult.frames_data.max_scores, borderColor: 'blue', fill: false }],
-  } : null;
+  const lineChartData = analysisResult?.frames_data
+    ? {
+        labels: analysisResult.frames_data.timestamps.map((t) => t.toFixed(2)),
+        datasets: [
+          {
+            label: 'Deepfake Score',
+            data: analysisResult.frames_data.max_scores,
+            borderColor: 'blue',
+            fill: false,
+          },
+        ],
+      }
+    : null;
 
-  const barChartData = analysisResult?.frames_data ? {
-    labels: analysisResult.frames_data.max_scores.map((_, i) => i),
-    datasets: [{ label: 'Score Distribution', data: analysisResult.frames_data.max_scores, backgroundColor: 'rgba(55, 83, 109, 0.5)' }],
-  } : null;
+  const barChartData = analysisResult?.frames_data
+    ? {
+        labels: analysisResult.frames_data.max_scores.map((_, i) => i),
+        datasets: [
+          {
+            label: 'Score Distribution',
+            data: analysisResult.frames_data.max_scores,
+            backgroundColor: 'rgba(55, 83, 109, 0.5)',
+          },
+        ],
+      }
+    : null;
 
   const chartOptions = {
     responsive: true,
     plugins: { legend: { position: 'top' }, title: { display: true } },
-    scales: { x: { title: { display: true, text: 'Time (s)' } }, y: { title: { display: true, text: 'Score' }, beginAtZero: true, max: 1 } },
+    scales: {
+      x: { title: { display: true, text: 'Time (s)' } },
+      y: { title: { display: true, text: 'Score' }, beginAtZero: true, max: 1 },
+    },
   };
 
   // Dummy coordinates for locations (replace with actual geocoding if needed)
-  const locations = analysisResult?.text_analysis?.locations?.map(loc => ({
-    name: loc.text,
-    latitude: 51.505,  // Placeholder; use a geocoding API in production
-    longitude: -0.09
-  })) || [];
+  const locations =
+    analysisResult?.text_analysis?.locations?.map((loc) => ({
+      name: loc.text,
+      latitude: 51.505, // Placeholder; use a geocoding API in production
+      longitude: -0.09,
+    })) || [];
 
   return (
     <div style={{ padding: '20px', fontFamily: 'Arial, sans-serif' }}>
@@ -177,7 +205,9 @@ const VideoAnalytics = () => {
 
       <form onSubmit={handleSubmit}>
         <input type="file" accept="video/*" onChange={handleFileChange} disabled={loading} />
-        <button type="submit" disabled={loading || !file}>{loading ? 'Analyzing...' : 'Analyze Video'}</button>
+        <button type="submit" disabled={loading || !file}>
+          {loading ? 'Analyzing...' : 'Analyze Video'}
+        </button>
       </form>
 
       {videoUrl && (
@@ -208,14 +238,39 @@ const VideoAnalytics = () => {
             <strong>Transcription:</strong>{' '}
             {analysisResult.transcription || 'No transcription available'}
             <div>
-              <select value={language} onChange={(e) => setLanguage(e.target.value)} style={{ margin: '10px' }}>
+              <select
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+                style={{ margin: '10px' }}
+              >
                 <option value="en">English</option>
                 <option value="es">Spanish</option>
                 <option value="fr">French</option>
+                {/* Indic Languages */}
                 <option value="hi">Hindi</option>
+                <option value="bn">Bengali</option>
+                <option value="ta">Tamil</option>
+                <option value="te">Telugu</option>
+                <option value="mr">Marathi</option>
+                <option value="gu">Gujarati</option>
+                <option value="kn">Kannada</option>
+                <option value="ml">Malayalam</option>
+                <option value="pa">Punjabi</option>
+                {/* Additional Languages */}
+                <option value="de">German</option>
+                <option value="it">Italian</option>
+                <option value="zh">Chinese (Simplified)</option>
+                <option value="ja">Japanese</option>
+                <option value="ko">Korean</option>
               </select>
-              <button onClick={handleTranslate} disabled={loading}>Translate</button>
-              {translation && <p><strong>Translated ({language}):</strong> {translation}</p>}
+              <button onClick={handleTranslate} disabled={loading || !analysisResult.transcription}>
+                {loading ? 'Translating...' : 'Translate'}
+              </button>
+              {translation && (
+                <p>
+                  <strong>Translated ({language}):</strong> {translation}
+                </p>
+              )}
             </div>
           </div>
 
@@ -239,14 +294,27 @@ const VideoAnalytics = () => {
           {lineChartData && (
             <div style={{ marginTop: '20px' }}>
               <h3>Deepfake Detection Over Time</h3>
-              <Line data={lineChartData} options={{ ...chartOptions, plugins: { ...chartOptions.plugins, title: { text: 'Deepfake Detection Over Time' } } }} />
+              <Line
+                data={lineChartData}
+                options={{
+                  ...chartOptions,
+                  plugins: { ...chartOptions.plugins, title: { text: 'Deepfake Detection Over Time' } },
+                }}
+              />
             </div>
           )}
 
           {barChartData && (
             <div style={{ marginTop: '20px' }}>
               <h3>Score Distribution</h3>
-              <Bar data={barChartData} options={{ ...chartOptions, plugins: { ...chartOptions.plugins, title: { text: 'Score Distribution' } }, scales: { x: { title: { text: 'Frame Index' } } } }} />
+              <Bar
+                data={barChartData}
+                options={{
+                  ...chartOptions,
+                  plugins: { ...chartOptions.plugins, title: { text: 'Score Distribution' } },
+                  scales: { x: { title: { text: 'Frame Index' } } },
+                }}
+              />
             </div>
           )}
 
@@ -256,13 +324,15 @@ const VideoAnalytics = () => {
               <ul>
                 {analysisResult.frames_data.timestamps.map((timestamp, index) => (
                   <li key={index}>
-                    Timestamp: {timestamp.toFixed(2)}s,
-                    Deepfake Score: {(analysisResult.frames_data.max_scores[index] || 0).toFixed(2)},
-                    Face Detected: {analysisResult.frames_data.faces_detected[index] ? 'Yes' : 'No'}
+                    Timestamp: {timestamp.toFixed(2)}s, Deepfake Score:{' '}
+                    {(analysisResult.frames_data.max_scores[index] || 0).toFixed(2)}, Face Detected:{' '}
+                    {analysisResult.frames_data.faces_detected[index] ? 'Yes' : 'No'}
                   </li>
                 ))}
               </ul>
-              <button onClick={handleDownload} style={{ marginTop: '10px' }}>Download Results as CSV</button>
+              <button onClick={handleDownload} style={{ marginTop: '10px' }}>
+                Download Results as CSV
+              </button>
             </div>
           )}
 
@@ -298,21 +368,41 @@ const VideoAnalytics = () => {
             <div>
               <strong>Text Analysis:</strong>
               <ul>
-                <li>Sentiment: {analysisResult.text_analysis.sentiment?.label || 'N/A'} (Score: {analysisResult.text_analysis.sentiment?.score?.toFixed(2) || 'N/A'})</li>
-                <li>Manipulation Score: {analysisResult.text_analysis.manipulation_score?.toFixed(2) || 'N/A'}</li>
-                <li>Emotional Triggers: {analysisResult.text_analysis.emotional_triggers?.join(', ') || 'None'}</li>
-                <li>Stereotypes: {analysisResult.text_analysis.stereotypes?.join(', ') || 'None'}</li>
+                <li>
+                  Sentiment: {analysisResult.text_analysis.sentiment?.label || 'N/A'} (Score:{' '}
+                  {analysisResult.text_analysis.sentiment?.score?.toFixed(2) || 'N/A'})
+                </li>
+                <li>
+                  Manipulation Score:{' '}
+                  {analysisResult.text_analysis.manipulation_score?.toFixed(2) || 'N/A'}
+                </li>
+                <li>
+                  Emotional Triggers:{' '}
+                  {analysisResult.text_analysis.emotional_triggers?.join(', ') || 'None'}
+                </li>
+                <li>
+                  Stereotypes: {analysisResult.text_analysis.stereotypes?.join(', ') || 'None'}
+                </li>
                 <li>
                   Entities:
                   {analysisResult.text_analysis.entities?.length > 0 ? (
                     <ul>
                       {analysisResult.text_analysis.entities.map((entity, idx) => (
-                        <li key={idx}>{entity.text} ({entity.type})</li>
+                        <li key={idx}>
+                          {entity.text} ({entity.type})
+                        </li>
                       ))}
                     </ul>
-                  ) : ' None'}
+                  ) : (
+                    ' None'
+                  )}
                 </li>
-                <li>Fact Checks: {analysisResult.text_analysis.fact_checks?.length > 0 ? JSON.stringify(analysisResult.text_analysis.fact_checks) : 'None'}</li>
+                <li>
+                  Fact Checks:{' '}
+                  {analysisResult.text_analysis.fact_checks?.length > 0
+                    ? JSON.stringify(analysisResult.text_analysis.fact_checks)
+                    : 'None'}
+                </li>
               </ul>
             </div>
           )}

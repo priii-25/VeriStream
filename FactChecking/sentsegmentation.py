@@ -150,7 +150,8 @@ def fact_check_pipeline(text_stream, manager):
 input_stream = [
     "The Earth is flat and I love flat maps because the moon is made of cheese.",
     "Climate change is a hoax. I think summers are nicer now.",
-    "Is the sky blue? One plus one equals two. Umm, yeah, so like..."
+    "Is the sky blue? One plus one equals two. Umm, yeah, so like...",
+    "Cabrilla Lattuan has called well had been on the run for four years"
 ]
 
 manager = FactCheckManager(api_key="dummy_key")

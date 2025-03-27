@@ -54,3 +54,8 @@ pymongo
 python-dotenv
 networkx
 google-generativeai
+spacy 
+textblob 
+requests
+spacy
+textblob
