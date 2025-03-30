@@ -1,3 +1,4 @@
+# backend/knowledge_graph.py
 import networkx as nx
 import matplotlib.pyplot as plt
 from pyvis.network import Network
