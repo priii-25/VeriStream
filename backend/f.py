@@ -14,22 +14,31 @@ except ImportError: shap = None
 try:
     from groq import Groq, APIConnectionError, RateLimitError, APIStatusError
 except ImportError:
-    Groq = None
-    class APIConnectionError(Exception): pass
-    class RateLimitError(Exception): pass
-    class APIStatusError(Exception): pass
+    Groq = None; APIConnectionError=Exception; RateLimitError=Exception; APIStatusError=Exception # Dummy errors
 try:
     import spacy
     try:
-        NLP = spacy.load("en_core_web_sm")
-        logging.info("spaCy model 'en_core_web_sm' loaded.")
-    except OSError:
-        logging.error("spaCy model 'en_core_web_sm' not found. Download: python -m spacy download en_core_web_sm")
-        NLP = None
+        NLP = spacy.load("en_core_web_sm"); logging.info("spaCy model loaded.")
+    except OSError: logging.error("spaCy model not found."); NLP = None
+except ImportError: spacy = None; NLP = None
+# --- NEW: Import Transformers for Zero-Shot Classification ---
+try:
+    from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+    # Choose a zero-shot model
+    # ZS_MODEL_NAME = "facebook/bart-large-mnli"
+    ZS_MODEL_NAME = "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli" # Good multilingual alternative
+    # Initialize the pipeline globally (can take time on first run)
+    try:
+        zs_classifier = pipeline("zero-shot-classification", model=ZS_MODEL_NAME, device=DEVICE) # Use same device as embeddings
+        logging.info(f"Zero-shot classifier pipeline loaded ({ZS_MODEL_NAME}).")
+    except Exception as e:
+        logging.error(f"Failed to load zero-shot classifier pipeline '{ZS_MODEL_NAME}': {e}")
+        zs_classifier = None
 except ImportError:
-    spacy = None
-    NLP = None
+    logging.warning("Hugging Face `transformers` library not found. pip install transformers torch (or tensorflow/flax). Falling back to basic claim filtering.")
+    zs_classifier = None
 # --- End Imports ---
+
 import queue
 from threading import Thread, Lock, current_thread
 import sys
@@ -39,7 +48,7 @@ from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 
-# --- Configuration ---
+# --- Configuration (Mostly same) ---
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'; os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 try: import tensorflow as tf; tf.get_logger().setLevel('ERROR')
 except ImportError: pass
@@ -54,6 +63,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # Clients
 groq_client = None
+# (Groq client init same as before)
 if Groq and GROQ_API_KEY:
     try: groq_client = Groq(api_key=GROQ_API_KEY); logging.info("Groq client initialized.")
     except Exception as e: logging.error(f"Failed Groq client init: {e}")
@@ -62,129 +72,119 @@ elif not GROQ_API_KEY: logging.warning("GROQ_API_KEY not found. LLM disabled.")
 
 # Models & Parameters
 EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
-DEVICE = 'cpu'
+DEVICE = 'cpu' # Ensure DEVICE is set correctly for transformers pipeline too
 LLM_PROVIDER = "Groq"
 LLM_MODEL_NAME = "llama3-8b-8192"
-NUM_SEARCH_RESULTS = 3 # Keep lower
+NUM_SEARCH_RESULTS = 3
 RAG_K = 3
-# Keywords for filtering non-checkable claims
-OPINION_PHRASES = ["i think", "i believe", "in my opinion", "seems like", "feels like", "should be", "must be"]
-SUBJECTIVE_ADJECTIVES = ["beautiful", "ugly", "amazing", "terrible", "wonderful", "awful", "best", "worst", "nice", "bad", "good", "great"] # Added great
-SELF_REFERENCE_WORDS = ["this sentence", "this claim", "this statement", "i say", "i state", "this phrase"]
+# --- NEW: Zero-Shot Classifier Settings ---
+ZS_CANDIDATE_LABELS = ["factual claim", "opinion or subjective statement", "question", "command or instruction", "incomplete phrase", "other non-factual"]
+ZS_FACTUAL_LABEL = "factual claim"
+ZS_CONFIDENCE_THRESHOLD = 0.60 # Minimum confidence score to classify as factual
+# --- End Zero-Shot Settings ---
+
 KG_RELEVANT_NER_LABELS = {"PERSON", "ORG", "GPE", "LOC", "DATE", "TIME", "MONEY", "QUANTITY", "PERCENT", "CARDINAL", "ORDINAL", "PRODUCT", "EVENT", "WORK_OF_ART", "LAW", "NORP", "FAC"}
 
-# Logging
+# Logging (same)
 log_file = 'fact_checker.log'
 with open(log_file, 'w', encoding='utf-8') as f: pass
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s', handlers=[logging.FileHandler(log_file, encoding='utf-8'), logging.StreamHandler(stream=sys.stdout)])
 
-# NLTK
+# NLTK (same)
 try: nltk.data.find('tokenizers/punkt')
 except: logging.info("Downloading NLTK 'punkt'..."); nltk.download('punkt', quiet=True); logging.info("'punkt' downloaded.")
 
-# --- API Functions ---
+# --- API Functions (Unchanged) ---
 def google_fact_check(query: str, api_key: str) -> list:
-    # Uses preprocessed query
     if not api_key: logging.error("GFactCheck Key missing."); return [{'verdict': 'Error', 'evidence': 'API Key missing'}]
     logging.debug(f"Querying GFactCheck API with: '{query}'")
-    try:
-        url="https://factchecktools.googleapis.com/v1alpha1/claims:search"; params={'query':query,'key':api_key,'languageCode':'en'}
-        response = requests.get(url, params=params, timeout=10); response.raise_for_status(); data = response.json()
-        if 'claims' in data and data['claims']:
-            claim = data['claims'][0]
-            if claim.get('claimReview'):
-                rev=claim['claimReview'][0]; verdict=rev.get('textualRating','Unknown'); ev=f"{rev.get('publisher',{}).get('name','?')} - {rev.get('url','No URL')}"; return [{'verdict': verdict, 'evidence': ev}]
-        return [{'verdict': 'Unknown', 'evidence': 'No matching fact-check found'}]
+    try: url="https://factchecktools.googleapis.com/v1alpha1/claims:search"; params={'query': query,'key': api_key,'languageCode': 'en'}; response=requests.get(url, params=params, timeout=10); response.raise_for_status(); data=response.json()
     except requests.exceptions.Timeout: logging.error(f"Timeout GFactCheck: '{query}'"); return [{'verdict': 'Error', 'evidence': 'API timeout'}]
     except requests.exceptions.RequestException as e: logging.error(f"Error GFactCheck API: {e}"); return [{'verdict': 'Error', 'evidence': f'API failed: {e}'}]
-    except Exception as e: logging.error(f"Error processing GFactCheck: {e}"); return [{'verdict': 'Error', 'evidence': f'Response processing failed: {e}'}]
+    except Exception as e: logging.error(f"Error processing GFactCheck: {e}"); return [{'verdict': 'Error', 'evidence': f'Resp processing fail: {e}'}]
+    if 'claims' in data and data['claims']:
+        claim = data['claims'][0]
+        if claim.get('claimReview'): rev=claim['claimReview'][0]; v=rev.get('textualRating','?'); e=f"{rev.get('publisher',{}).get('name','?')} - {rev.get('url','?')}"; return [{'verdict':v,'evidence':e}]
+    return [{'verdict': 'Unknown', 'evidence': 'No matching fact-check'}]
 
 def google_custom_search(query: str, api_key: str, cse_id: str, num: int) -> (dict, list):
-    # Uses preprocessed query
     if not api_key or not cse_id: logging.error("GCustomSearch keys missing."); return {}, []
     logging.debug(f"Querying GCustomSearch API with: '{query}'")
-    try:
-        url="https://www.googleapis.com/customsearch/v1"; params={'key':api_key,'cx':cse_id,'q':query,'num':num}
-        response = requests.get(url, params=params, timeout=15); response.raise_for_status(); full_response = response.json()
-        items = full_response.get('items', []); results = [{'title':item.get('title','?'),'snippet':item.get('snippet','').replace('\n',' '),'link':item.get('link','')} for item in items if item.get('snippet')]
-        logging.info(f"GCustomSearch got {len(results)} results for query '{query}'."); return full_response, results
+    try: url="https://www.googleapis.com/customsearch/v1"; params={'key':api_key,'cx':cse_id,'q':query,'num':num}; response=requests.get(url, params=params, timeout=15); response.raise_for_status(); full_resp=response.json()
     except requests.exceptions.Timeout: logging.error(f"Timeout GCustomSearch: '{query}'"); return {}, []
-    except requests.exceptions.RequestException as e: logging.error(f"Error GCustomSearch API: {e}"); return {}, [] # Graceful handle 429
+    except requests.exceptions.RequestException as e: logging.error(f"Error GCustomSearch API: {e}"); return {}, []
     except Exception as e: logging.error(f"Error processing GCustomSearch: {e}"); return {}, []
+    items=full_resp.get('items',[]); results=[{'title':i.get('title','?'),'snippet':i.get('snippet','').replace('\n',' '),'link':i.get('link','')} for i in items if i.get('snippet')]
+    logging.info(f"GCustomSearch got {len(results)} results for query '{query}'."); return full_resp, results
 
-# --- NEW LLM Final Verdict Function (Based on RAG) ---
+# --- LLM Function (Unchanged) ---
 def get_llm_final_verdict_from_rag(claim: str, rag_evidence: list, rag_status_msg: str) -> dict:
-    """Uses Groq LLM to determine a final True/False verdict based *only* on RAG evidence."""
-    if not groq_client: return {"final_label": "LLM Error", "explanation": "Groq client not initialized.", "confidence": 0.1}
-
-    rag_snippets_formatted = f"\nRetrieved Web Snippets (RAG Status: {rag_status_msg}):\n"
+    if not groq_client: return {"final_label":"LLM Error","explanation":"Groq client missing.","confidence":0.1}
+    rag_fmt=f"\nRetrieved Snippets (RAG Status:{rag_status_msg}):\n";
     if rag_evidence:
-        for i, doc in enumerate(rag_evidence): rag_snippets_formatted += f"{i+1}. Snippet: \"{doc.get('content','N/A')}\"\n   Source: {doc.get('metadata',{}).get('source','N/A')}\n"
-    else: rag_snippets_formatted += "None Provided or Retrieval Failed.\n"
-
-    # Prompt focuses ONLY on claim and RAG snippets
-    prompt = f"""You are a fact-checker. Evaluate the 'Claim' below based *only* on the provided 'Retrieved Web Snippets (RAG Evidence)'. Ignore any initial checks mentioned elsewhere.
+        for i,d in enumerate(rag_evidence): rag_fmt+=f"{i+1}. Snip:\"{d.get('content','?')}\"\n   Src:{d.get('metadata',{}).get('source','?')}\n"
+    else: rag_fmt+="None Provided/Failed.\n"
+    prompt=f"""Strictly evaluate the 'Claim' based *only* on the 'Retrieved Snippets'. Ignore external knowledge.
 
 Claim: "{claim}"
-{rag_snippets_formatted}
-Evaluation Task: Based *strictly* on the RAG evidence provided above, determine if the claim is True or False.
-- If the RAG snippets strongly and consistently support the claim, verdict is "True".
-- If the RAG snippets contradict the claim, verdict is "False".
-- If RAG evidence retrieval failed, returned no relevant snippets, or the snippets are clearly insufficient/irrelevant to judge the claim's factuality, the verdict *must* be "False" (indicating lack of verification from web search).
+{rag_fmt}
+Task: Is the claim True or False based *only* on the snippets? If snippets are missing, failed, irrelevant, or insufficient, verdict *must* be "False". Output *only* a valid JSON object with keys "verdict" (string "True" or "False") and "justification" (string, 1-2 sentences citing snippets/lack thereof).
 
-Output Format: Respond with *only* a valid JSON object containing exactly two keys:
-1. "verdict": Your verdict. Must be the string "True" or the string "False".
-2. "justification": A brief explanation (1-2 sentences) citing *only* the RAG evidence (or lack thereof) that led to your verdict.
-
-Example (Insufficient RAG):
-{{
-  "verdict": "False",
-  "justification": "RAG evidence retrieval failed (or snippets were irrelevant), so the claim could not be verified from web search."
-}}
-
+Example: {{"verdict": "False", "justification": "RAG failed, claim unverified."}}
 Your JSON Response:
 """
     logging.debug(f"LLM Final Verdict Prompt for '{claim}':\n{prompt}")
     try:
-        response = groq_client.chat.completions.create(model=LLM_MODEL_NAME, messages=[{"role":"system","content":"Output only valid JSON."}, {"role":"user","content":prompt}], temperature=0.0, max_tokens=150)
-        llm_output_text = response.choices[0].message.content; logging.debug(f"Groq LLM Raw: {llm_output_text}")
-        # Parse JSON
-        try:
-            if llm_output_text.strip().startswith("```json"): llm_output_text=llm_output_text.strip()[7:-3].strip()
-            elif llm_output_text.strip().startswith("```"): llm_output_text=llm_output_text.strip()[3:-3].strip()
-            llm_res = json.loads(llm_output_text); v=llm_res.get("verdict"); j=llm_res.get("justification")
-            if isinstance(v,str) and v in ["True","False"] and isinstance(j,str) and j:
-                conf = 0.90 if v=="True" else (0.88 if rag_evidence else 0.85) # Slightly lower confidence if False based on no evidence
-                return {"final_label":v, "explanation":j, "confidence":conf}
-            else: logging.error(f"LLM invalid content: {llm_output_text}"); return {"final_label":"LLM Error", "explanation":f"Invalid LLM JSON content: {llm_output_text}", "confidence":0.1}
-        except json.JSONDecodeError as e: logging.error(f"LLM JSON decode fail: {e}. Resp: {llm_output_text}"); return {"final_label":"LLM Error", "explanation":f"LLM non-JSON: {llm_output_text}", "confidence":0.1}
-        except Exception as e: logging.error(f"LLM parse err: {e}. Resp: {llm_output_text}"); return {"final_label":"LLM Error", "explanation":f"LLM parse err: {llm_output_text}", "confidence":0.1}
-    except APIConnectionError as e: logging.error(f"Groq ConnErr: {e}"); return {"final_label":"LLM Error", "explanation":f"API Conn Err: {e}", "confidence":0.1}
-    except RateLimitError as e: logging.error(f"Groq RateLimit: {e}"); time.sleep(5); return {"final_label":"LLM Error", "explanation":f"API Rate Limit: {e}", "confidence":0.1}
-    except APIStatusError as e: logging.error(f"Groq Status {e.status_code}: {e.response}"); return {"final_label":"LLM Error", "explanation":f"API Status {e.status_code}", "confidence":0.1}
-    except Exception as e: logging.error(f"Unexpected Groq API err: {e}", exc_info=True); return {"final_label":"LLM Error", "explanation":f"API Err: {e}", "confidence":0.1}
+        response=groq_client.chat.completions.create(model=LLM_MODEL_NAME,messages=[{"role":"system","content":"Output valid JSON."}, {"role":"user","content":prompt}], temperature=0.0,max_tokens=150)
+        llm_txt=response.choices[0].message.content; logging.debug(f"Groq LLM Raw: {llm_txt}")
+        try: # Parse
+            if llm_txt.strip().startswith("```json"): llm_txt=llm_txt.strip()[7:-3].strip()
+            elif llm_txt.strip().startswith("```"): llm_txt=llm_txt.strip()[3:-3].strip()
+            res=json.loads(llm_txt); v=res.get("verdict"); j=res.get("justification")
+            if isinstance(v,str) and v in ["True","False"] and isinstance(j,str) and j: conf=0.90 if v=="True" else (0.88 if rag_evidence else 0.85); return {"final_label":v,"explanation":j,"confidence":conf}
+            else: logging.error(f"LLM invalid content: {llm_txt}"); return {"final_label":"LLM Error","explanation":f"Invalid JSON content: {llm_txt}","confidence":0.1}
+        except Exception as e: logging.error(f"LLM parse fail: {e}. Resp:{llm_txt}"); return {"final_label":"LLM Error","explanation":f"LLM JSON parse err: {llm_txt}","confidence":0.1}
+    except APIConnectionError as e: logging.error(f"Groq ConnErr: {e}"); return {"final_label":"LLM Error","explanation":f"API Conn Err","confidence":0.1}
+    except RateLimitError as e: logging.error(f"Groq RateLimit: {e}"); time.sleep(5); return {"final_label":"LLM Error","explanation":f"API Rate Limit","confidence":0.1}
+    except APIStatusError as e: logging.error(f"Groq Status {e.status_code}"); return {"final_label":"LLM Error","explanation":f"API Status {e.status_code}","confidence":0.1}
+    except Exception as e: logging.error(f"Unexpected Groq API err: {e}",exc_info=True); return {"final_label":"LLM Error","explanation":f"API Err","confidence":0.1}
+
+# --- NEW: Zero-Shot Claim Checkability Function ---
+def is_claim_checkable_zero_shot(sentence: str) -> bool:
+    """Uses a zero-shot classification model to determine if a sentence is a factual claim."""
+    if not zs_classifier:
+        logging.warning("Zero-shot classifier not available, falling back to basic heuristics.")
+        # Call the old heuristic function as a fallback
+        from fact_checker_helpers import is_claim_checkable_heuristic # Assuming heuristics moved to a helper file
+        return is_claim_checkable_heuristic(sentence)
+
+    if not sentence or not isinstance(sentence, str): return False
+
+    try:
+        # Classify the sentence using the predefined labels
+        result = zs_classifier(sentence, ZS_CANDIDATE_LABELS, multi_label=False) # Assuming single best label
+
+        top_label = result['labels'][0]
+        top_score = result['scores'][0]
+
+        logging.debug(f"ZeroShot Check: '{sentence}' -> Top Label: {top_label} (Score: {top_score:.3f})")
+
+        # Check if the top label is the desired "factual claim" label and meets the confidence threshold
+        is_factual = (top_label == ZS_FACTUAL_LABEL and top_score >= ZS_CONFIDENCE_THRESHOLD)
+
+        if not is_factual:
+            logging.info(f"Claim filtered (ZeroShot): '{sentence}' -> Classified as: {top_label} (Score: {top_score:.3f})")
+        return is_factual
+
+    except Exception as e:
+        logging.error(f"Error during zero-shot classification for '{sentence}': {e}")
+        # Fallback strategy on error: maybe default to 'True' (checkable) or use heuristics?
+        # Let's default to checkable on error to avoid missing claims, but log it.
+        logging.warning(f"Zero-shot classification failed for '{sentence}', assuming checkable as fallback.")
+        return True
+# --- End Zero-Shot Function ---
 
 # --- Helper Functions ---
-def is_claim_checkable(sentence: str) -> bool:
-    # (Updated logic from previous answer)
-    if not sentence or not isinstance(sentence, str): return False
-    text_lower = sentence.lower().strip()
-    if text_lower.startswith('"') and text_lower.endswith('"'): text_lower = text_lower[1:-1]
-    if text_lower.startswith("'") and text_lower.endswith("'"): text_lower = text_lower[1:-1]
-    for phrase in OPINION_PHRASES:
-        if text_lower.startswith(phrase+" "): logging.info(f"Filtered (Opinion): '{sentence}'"); return False
-    if any(word in text_lower for word in SELF_REFERENCE_WORDS): logging.info(f"Filtered (Self-Ref): '{sentence}'"); return False
-    if text_lower.endswith("?"): logging.info(f"Filtered (Question): '{sentence}'"); return False
-    if NLP:
-        doc = NLP(sentence)
-        if any(t.lemma_.lower() in SUBJECTIVE_ADJECTIVES for t in doc if t.pos_=="ADJ"): logging.info(f"Filtered (Subjective): '{sentence}'"); return False
-        has_verb = any(t.pos_ in ("VERB","AUX") for t in doc); has_subj = any(t.dep_ in ("nsubj","nsubjpass","csubj","csubjpass","expl") for t in doc)
-        if not (has_verb and has_subj) and len(doc)<4: logging.info(f"Filtered (Structure): '{sentence}'"); return False
-        if len(doc)>0 and doc[0].pos_=="VERB" and doc[0].tag_=="VB":
-             is_imperative = not any(t.dep_.startswith("nsubj") for t in doc)
-             if is_imperative: logging.info(f"Filtered (Imperative): '{sentence}'"); return False
-    return True
-
 def preprocess_claim_for_api(original_claim: str) -> str:
     # (Same preprocessing logic as before)
     if not NLP or not original_claim: return original_claim
@@ -200,20 +200,16 @@ def preprocess_claim_for_api(original_claim: str) -> str:
             if "subj" in child.dep_: subj = child
             elif "obj" in child.dep_ or "attr" in child.dep_ or "acomp" in child.dep_:
                  obj_or_comp = child
-                 while True: # Try to find a more substantive head in the phrase
+                 while True:
                       potential_heads = [c for c in obj_or_comp.children if c.pos_ in ("NOUN", "PROPN", "ADJ", "NUM")]
-                      if potential_heads: obj_or_comp = potential_heads[0]; continue # Go deeper if possible
-                      else: break # Use current obj_or_comp
+                      if potential_heads: obj_or_comp = potential_heads[0]; continue
+                      else: break
         if subj: simplified_parts.append(subj.text)
         if negation: simplified_parts.append("not")
-        if root.pos_ != 'NOUN': # Avoid using nouns like 'capital' as the main verb if possible
-            simplified_parts.append(root.lemma_)
-        elif root.head.pos_ == 'VERB': # If root is noun but head is verb (e.g. auxiliary), use head verb
-             simplified_parts.append(root.head.lemma_)
-        # Add aux verb if needed (like 'is')
-        aux_verb = next((t for t in root.children if t.dep_ == 'aux' or (t.dep_=='attr' and t.pos_=='AUX')), None)
-        if not root.lemma_ in simplified_parts and aux_verb: simplified_parts.append(aux_verb.lemma_)
-
+        aux_verb = next((t for t in root.children if t.dep_=='aux' or (t.dep_=='attr'and t.pos_=='AUX')), None)
+        if root.pos_!='NOUN' and root.lemma_ not in simplified_parts: simplified_parts.append(root.lemma_)
+        elif root.head.pos_=='VERB' and root.head.lemma_ not in simplified_parts: simplified_parts.append(root.head.lemma_)
+        elif aux_verb and aux_verb.lemma_ not in simplified_parts: simplified_parts.append(aux_verb.lemma_)
         if obj_or_comp: simplified_parts.append(obj_or_comp.text)
         simplified_claim = " ".join(simplified_parts)
         if len(simplified_claim.split()) < 2 or not simplified_claim: logging.warning(f"Short simplification for '{original_claim}', using original."); return original_claim
@@ -230,32 +226,40 @@ class FactChecker:
         except Exception as e: logging.error(f"Model load failed: {e}"); raise RuntimeError(f"Could not load model: {e}") from e
         if shap is None: logging.warning("SHAP not installed.")
         self.shap_available = shap is not None
-        if NLP is None: logging.warning("spaCy model not loaded. Claim filtering/preprocessing basic.")
+        if NLP is None: logging.warning("spaCy model not loaded. NER/Preprocessing basic.")
         self.nlp_available = NLP is not None
+        if zs_classifier is None: logging.warning("Zero-shot classifier not loaded. Claim filtering basic.")
+        self.zs_classifier_available = zs_classifier is not None
+
         self.claim_queue=queue.Queue(); self.results={}; self.results_lock=Lock(); self.shap_explanations=[]
-        self.raw_fact_checks={}; self.raw_searches={}; self.claim_ner={}
+        self.raw_fact_checks={}; self.raw_searches={};
 
     def preprocess_and_filter(self, text: str) -> (list, list):
-        # (Same as before)
+        """Segments, filters (using zero-shot if available), NER, preprocesses."""
         if not text or not isinstance(text, str): logging.warning("Preprocess: Input empty."); return [], []
         sentences = []; checkable_claims_data = []; non_checkable_claims = []
         try:
             text=text.replace('.This','. This').replace('?This','? This').replace('!This','! This'); sentences=nltk.sent_tokenize(text); sentences=[s.strip() for s in sentences if s.strip()]; logging.info(f"Segmented {len(sentences)} sentences.")
         except Exception as e: logging.error(f"Tokenization error: {e}"); return [], []
+
         for sentence in sentences:
-            if is_claim_checkable(sentence):
+            # --- Use Zero-Shot Classifier for Filtering ---
+            is_checkable = is_claim_checkable_zero_shot(sentence)
+            # ---------------------------------------------
+            if is_checkable:
                 sentence_ner = [];
                 if self.nlp_available:
                     try: doc=NLP(sentence); sentence_ner=[{"text":ent.text,"label":ent.label_} for ent in doc.ents if ent.label_ in KG_RELEVANT_NER_LABELS]; logging.debug(f"NER for '{sentence}': {sentence_ner}")
                     except Exception as e: logging.error(f"NER fail '{sentence}': {e}")
                 preprocessed=preprocess_claim_for_api(sentence); checkable_claims_data.append({"original_claim":sentence,"preprocessed_claim":preprocessed,"ner_entities":sentence_ner})
-            else: non_checkable_claims.append(sentence)
-        logging.info(f"Found {len(checkable_claims_data)} checkable claims.");
-        if non_checkable_claims: logging.info(f"Filtered {len(non_checkable_claims)} non-checkable.")
+            else:
+                non_checkable_claims.append(sentence)
+        logging.info(f"Found {len(checkable_claims_data)} checkable claims after filtering.")
+        if non_checkable_claims: logging.info(f"Filtered {len(non_checkable_claims)} non-checkable sentences.")
         return checkable_claims_data, non_checkable_claims
 
     def classify_and_prioritize_claims(self, checkable_claims_data: list) -> list:
-        # (Same as before)
+        # (Priority scoring remains the same)
         if not checkable_claims_data: logging.warning("Prioritize: No data."); return []
         try:
             orig=[cd["original_claim"] for cd in checkable_claims_data]; embeds=self.embedding_model.encode(orig,convert_to_tensor=True,show_progress_bar=False)
@@ -266,7 +270,7 @@ class FactChecker:
         except Exception as e: logging.error(f"Prioritization error: {e}",exc_info=True); return []
 
     def add_claims_to_queue(self, claims_to_process: list):
-        # (Same as before)
+        # (Queueing remains the same)
         if not claims_to_process: logging.warning("Queue: No claims."); return
         for cd_dict in claims_to_process: self.claim_queue.put(cd_dict)
         logging.info(f"Queued {len(claims_to_process)} claims. Size: {self.claim_queue.qsize()}")
@@ -276,20 +280,18 @@ class FactChecker:
         original_claim = claim_data_dict['original_claim']; preprocessed_claim = claim_data_dict['preprocessed_claim']
         ner_entities = claim_data_dict['ner_entities']; start_time = time.time()
         logging.info(f"Processing: \"{original_claim}\" (API Query: \"{preprocessed_claim}\")")
-
         result = { # Initialize full result dict
             "original_claim": original_claim, "preprocessed_claim": preprocessed_claim, "ner_entities": ner_entities,
             "factual_score": claim_data_dict.get('score', None),
             "initial_verdict_raw": "N/A", "initial_evidence": "N/A", # Step 1 result
             "rag_status": "Not Attempted", "top_rag_snippets": [], # Step 2/3 results
             "final_verdict": "Pending", "final_explanation": "N/A" # Step 4 results (LLM)
-        }
-        rag_evidence_for_llm = [] # Data for LLM
+        }; rag_evidence_for_llm = []
 
         # --- Step 1: Initial Fact Check ---
         try:
             initial_check_list = google_fact_check(preprocessed_claim, GOOGLE_API_KEY)
-            self.raw_fact_checks[original_claim] = initial_check_list # Store raw
+            self.raw_fact_checks[original_claim] = initial_check_list
             initial_check = initial_check_list[0]
             result['initial_verdict_raw'] = initial_check.get('verdict', 'Error'); result['initial_evidence'] = initial_check.get('evidence', 'N/A')
             logging.info(f"GFactCheck Result: '{result['initial_verdict_raw']}'")
@@ -299,7 +301,7 @@ class FactChecker:
         search_results = []; full_search_resp = {}
         try:
             logging.debug(f"Attempting GCustomSearch '{preprocessed_claim}'..."); full_search_resp, search_results = google_custom_search(preprocessed_claim, GOOGLE_API_KEY, GOOGLE_CSE_ID, NUM_SEARCH_RESULTS)
-            self.raw_searches[original_claim] = {"query": preprocessed_claim, "response": full_search_resp, "results": search_results} # Store raw
+            self.raw_searches[original_claim] = {"query": preprocessed_claim, "response": full_search_resp, "results": search_results}
             if not search_results and not full_search_resp: result["rag_status"] = "Search Failed (API Error)"
             elif not search_results: result["rag_status"] = "Search OK, No Results"
             else: result["rag_status"] = "Search OK, Results Found"
@@ -314,24 +316,20 @@ class FactChecker:
                 if documents:
                     vector_store=FAISS.from_documents(documents,self.langchain_embeddings); logging.debug("FAISS index OK.")
                     retrieved_docs=vector_store.similarity_search(original_claim, k=RAG_K); rag_evidence_for_llm=[{"content":doc.page_content,"metadata":doc.metadata} for doc in retrieved_docs]
-                    result['top_rag_snippets']=[f"Snip {j+1}: \"{d['content'][:100]}...\" ({d['metadata'].get('source','?')})" for j,d in enumerate(rag_evidence_for_llm)] # Shorter snippets
+                    result['top_rag_snippets']=[f"Snip {j+1}: \"{d['content'][:100]}...\" ({d['metadata'].get('source','?')})" for j,d in enumerate(rag_evidence_for_llm)]
                     result["rag_status"] = f"RAG OK ({len(rag_evidence_for_llm)} snippets)"
                 else: result["rag_status"] = "Search OK, No Relevant Docs for Index"
             except Exception as e: logging.error(f"RAG fail: {e}",exc_info=False); result["rag_status"]=f"RAG Failed ({type(e).__name__})"; rag_evidence_for_llm=[]; result['top_rag_snippets']=[]
 
         # --- Step 4: LLM Final Verdict from RAG ---
         logging.info(f"LLM generating final verdict for '{original_claim}' from RAG...");
-        llm_final_result = get_llm_final_verdict_from_rag(
-            original_claim, # Base verdict on original claim
-            rag_evidence_for_llm, # Use only RAG evidence
-            result['rag_status']
-        )
+        llm_final_result = get_llm_final_verdict_from_rag(original_claim, rag_evidence_for_llm, result['rag_status'])
         result['final_verdict'] = f"{llm_final_result['final_label']} (Confidence: {llm_final_result['confidence']:.2f})"
-        result['final_explanation'] = llm_final_result['explanation'] # LLM's justification based on RAG
+        result['final_explanation'] = llm_final_result['explanation']
 
         processing_time = time.time() - start_time
         logging.info(f"Final Verdict for '{original_claim}': {result['final_verdict']}. (RAG-LLM Explain: {result['final_explanation']}). (Time:{processing_time:.2f}s)")
-        with self.results_lock: self.results[original_claim] = result # Store final result keyed by original claim
+        with self.results_lock: self.results[original_claim] = result
 
     def worker(self):
         # (Worker logic same)
@@ -343,12 +341,12 @@ class FactChecker:
             except Exception as e:
                 orig_claim=cd_dict.get('original_claim','?') if cd_dict else '?'; logging.error(f"W {t_name} err '{orig_claim}': {e}",exc_info=True)
                 if cd_dict:
-                    with self.results_lock: self.results[orig_claim]={"original_claim":orig_claim,"final_verdict":"Processing Error","final_explanation":f"Worker error: {e}"} # Store error
+                    with self.results_lock: self.results[orig_claim]={"original_claim":orig_claim,"final_verdict":"Processing Error","final_explanation":f"Worker error: {e}"}
                     self.claim_queue.task_done()
         logging.info(f"W {t_name} finish.")
 
     def train_and_run_shap(self, checkable_claims_data: list):
-        # (SHAP logic same - uses original_claim from dict)
+        # (SHAP logic remains the same)
         if not self.shap_available: logging.warning("SHAP unavailable."); self.shap_explanations = [{"claim":cd.get('original_claim', '?'),"shap_values":"[SHAP Unavailable]"} for cd in checkable_claims_data]; return
         logging.info("Attempting SHAP explanations...");
         valid_claims_data = [cd for cd in checkable_claims_data if cd.get("original_claim")]
@@ -364,21 +362,21 @@ class FactChecker:
         try:
             embeddings=self.embedding_model.encode(sentences,convert_to_tensor=False,show_progress_bar=False); logging.debug(f"SHAP embeds: {embeddings.shape if isinstance(embeddings,np.ndarray) else 'Invalid'}")
             def predict_scores(np_embeds):
-                 if not isinstance(np_embeds,np.ndarray):
-                     try: np_embeds=np.array(np_embeds); assert np_embeds.ndim==2
-                     except: logging.error("SHAP pred input err"); return np.full(len(np_embeds) if hasattr(np_embeds,'__len__') else 1, 0.5)
-                 scs=[];
-                 for e in np_embeds: r=float(np.linalg.norm(e)); s=0.5+(r/(r*25+1e-6)) if r>0 else 0.5; scs.append(min(max(s,0.0),1.0))
-                 return np.array(scs)
+                if not isinstance(np_embeds,np.ndarray):
+                    try: np_embeds=np.array(np_embeds); assert np_embeds.ndim==2
+                    except: logging.error("SHAP pred input err"); return np.full(len(np_embeds) if hasattr(np_embeds,'__len__') else 1, 0.5)
+                scs=[];
+                for e in np_embeds: r=float(np.linalg.norm(e)); s=0.5+(r/(r*25+1e-6)) if r>0 else 0.5; scs.append(min(max(s,0.0),1.0))
+                return np.array(scs)
             if not isinstance(embeddings,np.ndarray) or embeddings.ndim!=2 or embeddings.shape[0]<2: logging.error(f"Invalid embeds SHAP."); self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":"[SHAP Embed Err]"} for cd in valid_claims_data]; return
             embed_dim=embeddings.shape[1]; logging.debug("Creating SHAP bg..."); bg_obj=None
             try:
-                 n_c=min(10,embeddings.shape[0]); bg_obj=shap.kmeans(embeddings,n_c) if n_c>1 else embeddings
-                 bg_data=None
-                 if hasattr(bg_obj,'data') and isinstance(getattr(bg_obj,'data',None),np.ndarray): bg_data=bg_obj.data; logging.debug("Got .data from SHAP bg.")
-                 elif isinstance(bg_obj,np.ndarray): bg_data=bg_obj; logging.debug("Using np array for SHAP bg.")
-                 else: logging.error(f"Bad SHAP bg type: {type(bg_obj).__name__}."); self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Bg Type Err]"} for cd in valid_claims_data]; return
-                 logging.debug(f"SHAP Bg shape: {bg_data.shape}")
+                n_c=min(10,embeddings.shape[0]); bg_obj=shap.kmeans(embeddings,n_c) if n_c>1 else embeddings
+                bg_data=None
+                if hasattr(bg_obj,'data') and isinstance(getattr(bg_obj,'data',None),np.ndarray): bg_data=bg_obj.data; logging.debug("Got .data from SHAP bg.")
+                elif isinstance(bg_obj,np.ndarray): bg_data=bg_obj; logging.debug("Using np array for SHAP bg.")
+                else: logging.error(f"Bad SHAP bg type: {type(bg_obj).__name__}."); self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Bg Type Err]"} for cd in valid_claims_data]; return
+                logging.debug(f"SHAP Bg shape: {bg_data.shape}")
             except Exception as ke: logging.warning(f"KMeans fail: {ke}. Using raw."); bg_data=embeddings
             if bg_data is None or not isinstance(bg_data,np.ndarray): logging.error("SHAP bg prep fail."); return
             logging.debug("Init SHAP KernelExplainer..."); explainer=shap.KernelExplainer(predict_scores,bg_data)
@@ -386,16 +384,16 @@ class FactChecker:
             logging.info("SHAP vals calculated.")
             calc_expl=[]
             if shap_vals is not None and len(shap_vals)==len(sentences):
-                for i,ct in enumerate(sentences): calc_expl.append({"claim":ct,"shap_values":shap_vals[i].tolist()}) # Use original claim
+                for i,ct in enumerate(sentences): calc_expl.append({"claim":ct,"shap_values":shap_vals[i].tolist()})
                 logging.info(f"SHAP stored for {len(calc_expl)} claims.")
                 self.shap_explanations=calc_expl # Success
             else: logging.error(f"SHAP vals mismatch/None."); self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Calc Err]"} for cd in valid_claims_data]
         except Exception as e: logging.error(f"SHAP gen error: {e}",exc_info=True); final_dim=embed_dim if 'embed_dim' in locals() else embed_dim_fallback; self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Error: {type(e).__name__}]" if final_dim==0 else [0.0]*final_dim} for cd in valid_claims_data]
 
     def generate_chain_of_thought(self, checkable_claims_data: list, non_checkable_claims: list) -> str:
-        # (CoT updated for new pipeline)
+        # (Updated CoT logic)
         cot = ["Chain of Thought Summary:"]
-        cot.append("1. Preprocessed: Segmented, Filtered, NER, Simplified checkable claims for API.")
+        cot.append("1. Preprocessed: Segmented, Filtered (ZeroShot/Heuristic), NER, Simplified checkable claims for API.")
         if non_checkable_claims: cot.append(f"   - Filtered Non-Checkable ({len(non_checkable_claims)}): {non_checkable_claims}")
         claims_str=[f"'{c['original_claim']}' (Prio:{c.get('priority',0):.2f})" for c in checkable_claims_data]
         if claims_str: cot.append(f"   - Prioritized Checkable ({len(claims_str)}): [{', '.join(claims_str)}]")
@@ -406,9 +404,11 @@ class FactChecker:
                 claim=cd_proc['original_claim']; res=self.results.get(claim)
                 if res:
                     cot.append(f"   - Claim {i+1}: '{claim}'")
-                    cot.append(f"     - Initial Check (using '{res.get('preprocessed_claim','?')}'): Verdict='{res.get('initial_verdict_raw','?')}'")
-                    cot.append(f"     - RAG Status (using '{res.get('preprocessed_claim','?')}'): {res.get('rag_status','?')}")
-                    cot.append(f"     - LLM Final Verdict (based on RAG for original claim '{claim}'): {res.get('final_verdict','?')}")
+                    cot.append(f"     - API Query: '{res.get('preprocessed_claim','?')}'")
+                    cot.append(f"     - NER Entities: {res.get('ner_entities', [])}")
+                    cot.append(f"     - Initial Check: Verdict='{res.get('initial_verdict_raw','?')}'")
+                    cot.append(f"     - RAG Status: {res.get('rag_status','?')}")
+                    cot.append(f"     - LLM Final Verdict (RAG-Based): {res.get('final_verdict','?')}")
                     cot.append(f"     - LLM Justification: {res.get('final_explanation','?')}")
                 else: cot.append(f"   - Claim {i+1}: '{claim}' -> Result Missing!")
         cot.append("3. Generated SHAP for checkable claims' classification scores (if available/successful).")
@@ -418,28 +418,28 @@ class FactChecker:
              for ex in self.shap_explanations:
                  v=ex.get('shap_values',[]); s="[Err/Unavail]"
                  if isinstance(v,list) and v:
-                     if all(isinstance(x,(int,float)) for x in v): s=f"[...{len(v)} SHAP vals...]" if not all(abs(y)<1e-9 for y in v) else "[SHAP Err Fallback]"; has_real=True if s.startswith("[...") else has_real
+                     if all(isinstance(x,(int,float)) for x in v): s=f"[...{len(v)} vals]" if not all(abs(y)<1e-9 for y in v) else "[Err Fallback]"; has_real=True if s.startswith("[...") else has_real
                      else: s=str(v)
                  elif isinstance(v,str): s=v
                  elif not v: s="[No Data]"
-                 sh_sum.append(f"'{ex.get('claim','?')}': {s}") # Use original claim key
+                 sh_sum.append(f"'{ex.get('claim','?')}': {s}")
              status = "Generated." if has_real else "Failed/Unavailable."
              cot.append(f"   - SHAP Status: {status} Details: {{{', '.join(sh_sum)}}}")
-        else: cot.append("   - SHAP analysis skipped or no results.")
+        else: cot.append("   - SHAP analysis skipped/no results.")
         return "\n".join(cot)
 
     def check(self, text: str, num_workers: int = 2) -> dict:
         start=time.time(); logging.info(f"Starting check: \"{text[:100]}...\"")
-        with self.results_lock: self.results={}; self.shap_explanations=[]; self.raw_fact_checks={}; self.raw_searches={} # No claim_ner needed here
+        with self.results_lock: self.results={}; self.shap_explanations=[]; self.raw_fact_checks={}; self.raw_searches={}
         while not self.claim_queue.empty():
             try: self.claim_queue.get_nowait(); self.claim_queue.task_done()
             except: break
 
         logging.info("Step 1: Preprocessing & Filtering..."); checkable_claims_data, non_checkable_sents=self.preprocess_and_filter(text) # Returns list of dicts
-        if not checkable_claims_data: logging.warning("No checkable claims found."); return {"processed_claims":[], "non_checkable_claims":non_checkable_sents, "summary":"No checkable claims.", "raw_fact_checks":{}, "raw_searches":{}}
+        if not checkable_claims_data: logging.warning("No checkable claims found."); return {"processed_claims":[], "non_checkable_claims": non_checkable_sents, "summary":"No checkable claims.", "raw_fact_checks":{}, "raw_searches":{}}
 
         logging.info("Step 2: Prioritizing..."); claims_to_process=self.classify_and_prioritize_claims(checkable_claims_data) # Returns list of dicts w/ priority
-        if not claims_to_process: logging.warning("Prioritization failed."); return {"processed_claims":[], "non_checkable_claims":non_checkable_sents, "summary":"Prioritization failed.", "raw_fact_checks":{}, "raw_searches":{}}
+        if not claims_to_process: logging.warning("Prioritization failed."); return {"processed_claims":[], "non_checkable_claims": non_checkable_sents, "summary":"Prioritization failed.", "raw_fact_checks":{}, "raw_searches":{}}
 
         logging.info("Step 3: Queueing..."); self.add_claims_to_queue(claims_to_process) # Queue the dicts
         logging.info("Step 4: Processing via Workers..."); # Worker logic same
@@ -450,29 +450,24 @@ class FactChecker:
             self.claim_queue.join(); logging.info("Workers finished.")
         else: logging.info("No claims queued.")
 
-        # --- Intermediate Output Moved to Main ---
+        # Intermediate output now happens in main block after check() returns
 
-        # 5. Generate SHAP (after processing)
-        logging.info("Step 5: Generating SHAP (if installed)..."); self.train_and_run_shap(claims_to_process)
-
-        # 6. Consolidate Results (Final results dict generation)
-        logging.info("Step 6: Consolidating final results..."); results_list=[]; ok_count=0; err_count=0
+        logging.info("Step 5: Generating SHAP..."); self.train_and_run_shap(claims_to_process) # Pass list of dicts
+        logging.info("Step 6: Consolidating..."); results_list=[]; ok_count=0; err_count=0
         with self.results_lock:
-            for cd in claims_to_process: # Iterate through original list of dicts
-                 original_claim = cd['original_claim']
-                 res = self.results.get(original_claim) # Fetch processed result
+            for cd in claims_to_process:
+                 res = self.results.get(cd['original_claim'])
                  if res:
                       results_list.append(res); ok_count+=1
-                      # Count errors based on final verdict state
                       if res.get("final_verdict", "").startswith(("Error","LLM Error","Processing Error","Missing")): err_count+=1
-                 else: logging.error(f"Result missing: '{original_claim}'."); results_list.append({"original_claim":original_claim,"final_verdict":"Missing Result","final_explanation":"Result lost during processing."}); err_count+=1
+                 else: logging.error(f"Result missing: '{cd['original_claim']}'."); results_list.append({"original_claim":cd['original_claim'],"final_verdict":"Missing Result","final_explanation":"Result lost."}); err_count+=1
 
-        summary=self.generate_chain_of_thought(claims_to_process, non_checkable_sents) # Generate CoT summary
+        summary=self.generate_chain_of_thought(claims_to_process, non_checkable_sents) # Generate CoT
         duration = time.time() - start
         logging.info(f"Check complete. Processed {ok_count} checkable claims ({err_count} errors) in {duration:.2f}s.")
-        # Return all relevant data structures
-        return {"processed_claims":results_list, "non_checkable_claims":non_checkable_sents, "summary":summary, "raw_fact_checks":self.raw_fact_checks, "raw_searches":self.raw_searches, "shap_explanations": self.shap_explanations} # Return SHAP results too
+        return {"processed_claims":results_list, "non_checkable_claims":non_checkable_sents, "summary":summary, "raw_fact_checks":self.raw_fact_checks, "raw_searches":self.raw_searches, "shap_explanations": self.shap_explanations}
 # --- End FactChecker Class ---
+
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
@@ -480,11 +475,14 @@ if __name__ == "__main__":
     if shap is None: print("\nWARN: SHAP lib missing. pip install shap\n")
     else: print("SHAP library found.")
     if spacy is None: print("\nWARN: spaCy lib missing. pip install spacy\n")
-    elif NLP is None: print("\nWARN: spaCy model 'en_core_web_sm' missing. python -m spacy download en_core_web_sm\n")
+    elif NLP is None: print("\nWARN: spaCy model missing. python -m spacy download en_core_web_sm\n")
     else: print("spaCy library and model found.")
     if Groq is None: print(f"\nWARN: Groq lib missing. LLM ({LLM_PROVIDER}) disabled. pip install groq\n")
     elif groq_client is None: print(f"\nWARN: Groq client init failed (check key). LLM ({LLM_PROVIDER}) disabled.\n")
     else: print(f"{LLM_PROVIDER} client available (Model: {LLM_MODEL_NAME}).")
+    if zs_classifier is None: print("\nWARN: Transformers pipeline failed. Claim filtering fallback to basic heuristics (if implemented).")
+    else: print(f"Zero-shot classifier available ({ZS_MODEL_NAME}).")
+
 
     print("Fact Checker Initializing...")
     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID: logging.critical("CRIT: Google keys missing."); print("\nCRIT ERR: Google keys missing."); exit(1)
@@ -505,7 +503,7 @@ if __name__ == "__main__":
     except Exception as e: logging.critical(f"Unexpected init err: {e}",exc_info=True); print(f"\nCRIT UNEXPECTED init err. Logs:{log_file}. Err:{e}"); exit(1)
 
     print("\n--- Starting Fact Check Pipeline ---\n")
-    results_data = checker.check(input_text, num_workers=2) # checker.check now returns the final dict
+    results_data = checker.check(input_text, num_workers=2)
 
     # --- NEW OUTPUT ORDER ---
 
@@ -517,21 +515,22 @@ if __name__ == "__main__":
                 print(f"\nClaim (Original): \"{claim}\"")
                 if api_res_list:
                     for res_item in api_res_list: print(f"  - Verdict: {res_item.get('verdict','?')} | Evidence: {res_item.get('evidence','?')}")
-                else: print("  - No result stored (API call likely failed).")
+                else: print("  - No result stored (API call likely failed before storage).")
         else: print("  - No Fact Check API calls were made or stored.")
     else: print("  - Raw Fact Check data structure missing.")
     print("="*81)
 
     # 2. Raw Google Custom Search Snippets (Optional)
-    SHOW_RAW_SEARCH = False # Keep this False unless debugging search itself
+    SHOW_RAW_SEARCH = False # Set to True to show detailed search results
     if SHOW_RAW_SEARCH and results_data.get("raw_searches"):
         print("\n" + "="*25 + " Intermediate Output 2: Raw Google Custom Search Snippets " + "="*14)
+        # (Printing logic same as before)
         if results_data["raw_searches"]:
             for claim, search_data in results_data["raw_searches"].items():
                 print(f"\nClaim (Original): \"{claim}\""); print(f"  (API Query: \"{search_data.get('query', '?')}\")")
                 search_results = search_data.get("results", [])
                 if search_results:
-                    for i, item in enumerate(search_results): print(f"  {i+1}. T: {item.get('title','?')}\n     S: {item.get('snippet','?')}\n     L: {item.get('link','?')}")
+                    for i, item in enumerate(search_results): print(f"  {i+1}. T:{item.get('title','?')}\n     S:{item.get('snippet','?')}\n     L:{item.get('link','?')}")
                 elif search_data.get("response") is not None: print("  - Search OK, no items.")
                 else: print("  - Search API call likely failed.")
         else: print("  - No Custom Search API calls were made or stored.")
@@ -544,7 +543,7 @@ if __name__ == "__main__":
     else: print("  - No sentences were filtered out.")
     print("="*81)
 
-    # 4. Detailed Processed Claim Results (Includes NER, RAG Status, Final LLM Verdict)
+    # 4. Detailed Processed Claim Results (Final Verdict based on RAG+LLM)
     print("\n" + "="*30 + " Final Processed Claim Details " + "="*30)
     if results_data and results_data.get("processed_claims"):
         for i, res in enumerate(results_data["processed_claims"]):
@@ -553,11 +552,11 @@ if __name__ == "__main__":
             ner_ents = res.get('ner_entities', [])
             if ner_ents: print(f"  - NER Entities: {', '.join([f'{e['text']}({e['label']})' for e in ner_ents])}")
             else: print("  - NER Entities: None Found")
-            print(f"  - Initial Check Result: '{res.get('initial_verdict_raw','?')}'")
+            print(f"  - Initial GFactCheck Result: '{res.get('initial_verdict_raw','?')}'") # Display initial check just for context
             print(f"  - RAG Status: {res.get('rag_status', '?')}")
             if res.get('top_rag_snippets'): print("  - Top RAG Snippets:"); [print(f"    {j+1}. {snip}") for j,snip in enumerate(res.get('top_rag_snippets',[]))]
-            print(f"  - Final Verdict (RAG+LLM): {res.get('final_verdict', '?')}") # Emphasize source
-            print(f"  - LLM Justification: {res.get('final_explanation', '?')}")
+            print(f"  >>> Final Verdict (RAG+{LLM_PROVIDER} LLM): {res.get('final_verdict', '?')}") # Highlight final verdict source
+            print(f"      LLM Justification: {res.get('final_explanation', '?')}")
     else: print("No checkable claims were processed or results available.")
     print("="*83)
 
@@ -572,14 +571,11 @@ if __name__ == "__main__":
                  else: s=str(v)
              elif isinstance(v,str): s=v
              elif not v: s="[No Data]"
-             shap_summary.append(f"'{expl.get('claim','?')}': {s}")
+             shap_summary.append(f"'{expl.get('claim','?')}': {s}") # Use original claim key
          status = "Generated." if has_real else "Failed/Unavailable."
          print(f"  - SHAP Status: {status}")
          if shap_summary: print(f"  - Details: {{{', '.join(shap_summary)}}}")
-         # Add reminder to check log file for errors
-         if not has_real and shap is not None:
-              if any("[SHAP Error" in str(expl.get("shap_values","")) for expl in results_data["shap_explanations"]):
-                   print(f"\n  *** SHAP Error Detected: Check '{log_file}' for traceback. ***")
+         if not has_real and shap is not None and any("[SHAP Error" in str(expl.get("shap_values","")) for expl in results_data["shap_explanations"]): print(f"\n  *** SHAP Error Detected: Check '{log_file}' for traceback. ***")
     else: print("  - SHAP analysis skipped or no results structure.")
     print("="*86)
 
