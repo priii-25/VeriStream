@@ -10,7 +10,7 @@ from spark_video_processor import SparkVideoProcessor
 from optimized_deepfake_detector import OptimizedDeepfakeDetector
 from streamlink import Streamlink
 from knowledge_graph import KnowledgeGraphManager
-from fact_checker import FactCheckManager, fact_check_text
+#from fact_checker import FactCheckManager, fact_check_text
 import cv2
 import numpy as np
 import asyncio
@@ -47,7 +47,7 @@ app.add_middleware(
 video_producer = VideoProducer()
 video_analyzer = VideoAnalyzer()
 text_analyzer = OptimizedAnalyzer(use_gpu=True)
-fact_checker = FactCheckManager(api_key=FACT_CHECK_API_KEY)
+#fact_checker = FactCheckManager(api_key=FACT_CHECK_API_KEY)
 spark_processor = SparkVideoProcessor()
 session = Streamlink()
 is_running = False
@@ -172,13 +172,13 @@ async def process_stream(stream_url):
                 fact_check_buffer_second += " " + transcription_second
 
                 if fact_check_buffer_first.strip():
-                    fact_check_results.extend(fact_check_text(fact_check_buffer_first, fact_checker))
+                    #fact_check_results.extend(fact_check_text(fact_check_buffer_first, fact_checker))
                     fact_check_buffer_first = ""
                 else:
                     fact_check_results.append({"verdict": "No claims", "evidence": "No transcription available for first half"})
 
                 if fact_check_buffer_second.strip():
-                    fact_check_results.extend(fact_check_text(fact_check_buffer_second, fact_checker))
+                    #fact_check_results.extend(fact_check_text(fact_check_buffer_second, fact_checker))
                     fact_check_buffer_second = ""
                 else:
                     fact_check_results.append({"verdict": "No claims", "evidence": "No transcription available for second half"})
@@ -388,7 +388,7 @@ async def analyze_video(file: UploadFile = File(...)):
             "final_score": final_score,
             "frames_data": frames_data,
             "text_analysis": {
-                "sentiment": analysis_result.sentiment,
+                "political_bias": analysis_result.political_bias,  # Updated to political_bias
                 "fact_checks": analysis_result.fact_checks,
                 "emotional_triggers": analysis_result.emotional_triggers,
                 "stereotypes": analysis_result.stereotypes,
@@ -405,7 +405,7 @@ async def analyze_video(file: UploadFile = File(...)):
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-
+            
 @app.get("/knowledge_graph")
 async def get_knowledge_graph():
     kg_html = "knowledge_graph.html"
@@ -444,7 +444,7 @@ def shutdown_event():
     global is_running
     is_running = False
     spark_processor.stop()
-    fact_checker.stop()
+    #fact_checker.stop()
     logger.info("Application shutdown complete")
 
 if __name__ == "__main__":
