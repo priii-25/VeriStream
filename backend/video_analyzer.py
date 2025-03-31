@@ -1,4 +1,4 @@
-# backend/video_analyzer.py
+#backend/video_analyzer.py
 import cv2
 import logging
 import whisper
@@ -47,9 +47,11 @@ class VideoAnalyzer:
             logger.info(f"Transcribing audio from {video_path}")
             result = self.whisper_model.transcribe(audio_path)
             transcription = result["text"]
+            detected_language = result["language"]  # Extract detected language (e.g., "en", "es", "hi")
         except Exception as e:
             logger.error(f"Failed to transcribe audio: {str(e)}")
             transcription = "Transcription failed"
+            detected_language = "unknown"
         finally:
             if os.path.exists(audio_path):
                 os.remove(audio_path)
@@ -63,4 +65,4 @@ class VideoAnalyzer:
             "faces_detected": faces_detected
         }
         
-        return transcription, final_score, frames_data
+        return transcription, final_score, frames_data, detected_language  # Return detected language

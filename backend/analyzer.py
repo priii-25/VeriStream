@@ -1,4 +1,4 @@
-# backend/analyzer.py
+#bckend/analyzer.py
 import os
 import re
 import time
@@ -15,7 +15,6 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipe
 from config import CACHE_TTL, MAX_RETRIES, TIMEOUT, BATCH_SIZE, FACT_CHECK_API_KEY, GOOGLE_API_KEY
 from knowledge_graph import KnowledgeGraphManager
 
-# Set up logging with detailed output
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('analyzer')
 
@@ -23,7 +22,7 @@ logger = logging.getLogger('analyzer')
 class AnalysisResult:
     """Data class to store analysis results"""
     text: str
-    political_bias: Dict  # Updated from sentiment to political_bias
+    political_bias: Dict
     fact_checks: List[Dict]
     emotional_triggers: List[str]
     stereotypes: List[str]
@@ -51,7 +50,6 @@ class OptimizedAnalyzer:
         """Initialize ML pipelines with optimized batch processing"""
         try:
             self.logger.info("Initializing ML pipelines...")
-            # Load fine-tuned political bias model
             model_path = "/Users/kartik/Desktop/vs/VeriStream/backend/models/political-sentiment-model"
             self.logger.debug(f"Loading political bias model from: {model_path}")
             if not os.path.exists(model_path):
@@ -65,7 +63,6 @@ class OptimizedAnalyzer:
             self.bias_label_map = {0: "Leftist", 1: "Rightish", 2: "Centric", 3: "Party-Specific"}
             self.logger.debug(f"Political bias model loaded. Labels: {self.bias_label_map}")
 
-            # Keep NER and zero-shot pipelines
             self.ner_pipeline = pipeline(
                 task="ner",
                 model="dslim/bert-base-NER",
@@ -88,11 +85,72 @@ class OptimizedAnalyzer:
         """Setup patterns for emotional and stereotype detection"""
         self.EMOTIONAL_TRIGGERS = [
             r"breaking news", r"fear of", r"unprecedented", r"urgent",
-            r"get rich quick", r"lose weight fast",
+            r"shocking", r"critical", r"emergency", r"life-changing",
+            r"act now", r"time is running out", r"don't miss out",
+            r"last chance", r"limited time", r"before it's too late",
+            r"alert", r"warning", r"danger", r"crisis", r"panic",
+            r"disaster", r"catastrophe", r"chaos", r"threat", r"terror",
+            r"amazing", r"incredible", r"unbelievable", r"mind-blowing",
+            r"jaw-dropping", r"once in a lifetime", r"exclusive", r"secret",
+            r"revealed", r"exposed", r"hidden truth", r"you won't believe",
+            r"shocking truth", r"must see", r"must watch", r"viral",
+            r"trending", r"explosive", r"sensational", r"scandal",
+            r"you should", r"you must", r"you need to", r"it's your duty",
+            r"responsibility", r"obligation", r"you owe it to", r"don't let down",
+            r"disappoint", r"failure", r"let everyone down", r"guilt",
+            r"shame", r"ashamed", r"regret", r"missed opportunity",
+            r"outrageous", r"disgusting", r"appalling", r"unacceptable",
+            r"infuriating", r"enraging", r"maddening", r"furious",
+            r"angry", r"rage", r"fury", r"indignation", r"resentment",
+            r"betrayal", r"treachery", r"hypocrisy", r"corruption",
+            r"heartbreaking", r"tragic", r"devastating", r"tear-jerking",
+            r"sob story", r"pitiful", r"miserable", r"depressing",
+            r"hopeless", r"helpless", r"despair", r"grief", r"sorrow",
+            r"mourn", r"loss", r"pain", r"suffering", r"anguish",
+            r"don't miss", r"exclusive offer", r"limited edition",
+            r"only a few left", r"while supplies last", r"free gift",
+            r"no risk", r"guaranteed", r"proven", r"scientifically proven",
+            r"miracle", r"instant results", r"overnight success",
+            r"secret method", r"hidden trick", r"loophole", r"hack",
+            r"cheat code", r"get rich quick", r"lose weight fast",
         ]
         self.STEREOTYPE_PATTERNS = [
-            r"women can't", r"men are always",
-            r"liberals are", r"conservatives are",
+            r"women can't", r"men are always", r"women should", r"men should",
+            r"women belong in", r"men belong in", r"women are too", r"men are too",
+            r"women are naturally", r"men are naturally", r"women are better at",
+            r"men are better at", r"women are worse at", r"men are worse at",
+            r"women are emotional", r"men are emotional", r"women are weak",
+            r"men are strong", r"women are submissive", r"men are dominant",
+            r"all \w+s are", r"\w+ people always", r"typical \w+ behavior",
+            r"\w+ people can't", r"\w+ people are lazy", r"\w+ people are greedy",
+            r"\w+ people are violent", r"\w+ people are criminals",
+            r"\w+ people are uneducated", r"\w+ people are poor",
+            r"\w+ people are rich", r"\w+ people are cheap",
+            r"\w+ people are aggressive", r"\w+ people are submissive",
+            r"\w+ people are exotic", r"\w+ people are primitive",
+            r"young people are", r"old people are", r"millennials are",
+            r"boomers are", r"gen z are", r"teenagers are", r"kids these days",
+            r"back in my day", r"young people don't", r"old people can't",
+            r"young people are lazy", r"old people are slow",
+            r"young people are entitled", r"old people are out of touch",
+            r"\w+ people are fanatics", r"\w+ people are intolerant",
+            r"\w+ people are extremists", r"\w+ people are terrorists",
+            r"\w+ people are backward", r"\w+ people are superstitious",
+            r"\w+ people are closed-minded", r"\w+ people are oppressive",
+            r"\w+ people are rude", r"\w+ people are arrogant",
+            r"\w+ people are lazy", r"\w+ people are hardworking",
+            r"\w+ people are dishonest", r"\w+ people are corrupt",
+            r"\w+ people are violent", r"\w+ people are peaceful",
+            r"\w+ people are greedy", r"\w+ people are generous",
+            r"all lawyers are", r"all doctors are", r"all teachers are",
+            r"all politicians are", r"all cops are", r"all artists are",
+            r"all engineers are", r"all scientists are", r"all bankers are",
+            r"all journalists are", r"all athletes are", r"all actors are",
+            r"poor people are", r"rich people are", r"homeless people are",
+            r"disabled people are", r"immigrants are", r"refugees are",
+            r"foreigners are", r"locals are", r"city people are",
+            r"country people are", r"educated people are",
+            r"uneducated people are", r"liberals are", r"conservatives are",
         ]
         self.logger.debug(f"Emotional triggers: {self.EMOTIONAL_TRIGGERS[:5]}... (total: {len(self.EMOTIONAL_TRIGGERS)})")
         self.logger.debug(f"Stereotype patterns: {self.STEREOTYPE_PATTERNS[:5]}... (total: {len(self.STEREOTYPE_PATTERNS)})")
@@ -188,13 +246,10 @@ class OptimizedAnalyzer:
     async def analyze_text(self, text: str) -> AnalysisResult:
         """Perform comprehensive text analysis asynchronously"""
         start_time = time.time()
-        self.logger.info(f"Starting analysis for text: {text}")
+        self.logger.info(f"Starting analysis for text: {text[:50]}...")  # Log truncated text for brevity
 
         try:
-            # Run async fact-checking
             fact_checks = await self.fact_check(text)
-            
-            # Synchronous ML tasks
             political_bias = self._analyze_political_bias(text)
             ner_result = self.ner_pipeline(text)
             classification = self.zero_shot_classifier(text, ["true claim", "false claim"])
@@ -269,7 +324,6 @@ class OptimizedAnalyzer:
             self.logger.error(f"Manipulation score computation failed: {e}")
             return 0.5
 
-# For testing standalone with enhanced debugging
 if __name__ == "__main__":
     print("Starting analyzer test...")
     logging.basicConfig(level=logging.DEBUG, force=True)

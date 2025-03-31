@@ -57,6 +57,38 @@ fact_check_buffer_first = ""
 fact_check_buffer_second = ""
 last_fact_check_time = 0
 
+async def translate_to_english(transcription: str, source_language: str) -> str:
+    """Translate text to English using Grok API if not already in English."""
+    if source_language == "en":
+        return transcription  # No translation needed
+    
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a translator. Translate the following text to English. Only provide the translated text, do not include any additional content or notes."
+                },
+                {
+                    "role": "user",
+                    "content": transcription
+                }
+            ],
+            "max_tokens": 1024
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json().get("choices", [{}])[0].get("message", {}).get("content", transcription)
+    except Exception as e:
+        logger.error(f"Translation to English failed: {str(e)}")
+        return transcription  # Fallback to original text if translation fails
+
 async def process_stream(stream_url):
     global is_running, fact_check_buffer_first, fact_check_buffer_second, last_fact_check_time
     logger.info(f"Starting stream processing for {stream_url}")
@@ -148,12 +180,19 @@ async def process_stream(stream_url):
                 subprocess.run(cmd_first, capture_output=True, text=True)
                 subprocess.run(cmd_second, capture_output=True, text=True)
 
-                # Transcribe both halves
+                # Transcribe both halves with language detection
                 transcription_first = ""
                 transcription_second = ""
+                detected_language_first = "unknown"
+                detected_language_second = "unknown"
+                english_transcription_first = ""
+                english_transcription_second = ""
+                
                 if os.path.exists(temp_audio_first) and os.path.getsize(temp_audio_first) > 0:
                     transcription_result = video_analyzer.whisper_model.transcribe(temp_audio_first)
                     transcription_first = transcription_result["text"]
+                    detected_language_first = transcription_result["language"]
+                    english_transcription_first = await translate_to_english(transcription_first, detected_language_first)
                 else:
                     logger.warning("No audio extracted for first half")
                     transcription_first = "[No audio]"
@@ -161,37 +200,52 @@ async def process_stream(stream_url):
                 if os.path.exists(temp_audio_second) and os.path.getsize(temp_audio_second) > 0:
                     transcription_result = video_analyzer.whisper_model.transcribe(temp_audio_second)
                     transcription_second = transcription_result["text"]
+                    detected_language_second = transcription_result["language"]
+                    english_transcription_second = await translate_to_english(transcription_second, detected_language_second)
                 else:
                     logger.warning("No audio extracted for second half")
                     transcription_second = "[No audio]"
 
-                # Fact-checking
+                # Fact-checking (using English transcriptions)
                 current_time = time.time()
                 fact_check_results = []
-                fact_check_buffer_first += " " + transcription_first
-                fact_check_buffer_second += " " + transcription_second
+                fact_check_buffer_first += " " + english_transcription_first
+                fact_check_buffer_second += " " + english_transcription_second
 
                 if fact_check_buffer_first.strip():
                     #fact_check_results.extend(fact_check_text(fact_check_buffer_first, fact_checker))
+                    fact_check_results.append({"verdict": "Pending", "evidence": fact_check_buffer_first})
                     fact_check_buffer_first = ""
                 else:
                     fact_check_results.append({"verdict": "No claims", "evidence": "No transcription available for first half"})
 
                 if fact_check_buffer_second.strip():
                     #fact_check_results.extend(fact_check_text(fact_check_buffer_second, fact_checker))
+                    fact_check_results.append({"verdict": "Pending", "evidence": fact_check_buffer_second})
                     fact_check_buffer_second = ""
                 else:
                     fact_check_results.append({"verdict": "No claims", "evidence": "No transcription available for second half"})
 
                 last_fact_check_time = current_time
 
-                # Prepare result
+                # Prepare result with multilingual data
                 result = {
                     "video_chunk": f"http://127.0.0.1:5000/temp/{os.path.basename(temp_video)}",
                     "timestamp": current_time - chunk_duration,
                     "deepfake_scores": deepfake_scores,
                     "faces_detected": faces_detected,
-                    "transcriptions": {"first_half": transcription_first, "second_half": transcription_second},
+                    "transcriptions": {
+                        "first_half": {
+                            "original": transcription_first,
+                            "detected_language": detected_language_first,
+                            "english": english_transcription_first
+                        },
+                        "second_half": {
+                            "original": transcription_second,
+                            "detected_language": detected_language_second,
+                            "english": english_transcription_second
+                        }
+                    },
                     "fact_checks": fact_check_results
                 }
                 await result_queue.put(result)
@@ -354,16 +408,22 @@ async def analyze_video(file: UploadFile = File(...)):
         total_frames = frame_info["total_frames"]
         await broadcast_progress(0.1)
         
-        transcription, final_score, frames_data = video_analyzer.analyze_video(temp_path, None)
+        # Get transcription and detected language (now returns 4 values)
+        transcription, final_score, frames_data, detected_language = video_analyzer.analyze_video(temp_path, None)
         await broadcast_progress(0.3)
         
-        analysis_result = await text_analyzer.analyze_text(transcription)
+        # Translate to English if not already in English
+        english_transcription = await translate_to_english(transcription, detected_language)
+        
+        # Analyze the English transcription
+        analysis_result = await text_analyzer.analyze_text(english_transcription)
         await broadcast_progress(0.6)
         
         spark_results = consume_spark_results(temp_path, timeout=60)
         if not spark_results or len(spark_results) != total_frames:
             logger.warning(f"Expected {total_frames} results, got {len(spark_results)}")
-            _, final_score, frames_data = video_analyzer.analyze_video(temp_path, None)
+            # Update fallback to handle 4 return values
+            transcription, final_score, frames_data, _ = video_analyzer.analyze_video(temp_path, None)
         else:
             frames_data = {
                 "timestamps": [r["timestamp"] for r in spark_results],
@@ -384,7 +444,9 @@ async def analyze_video(file: UploadFile = File(...)):
         kg_manager.visualize_graph("knowledge_graph.html")
 
         response = {
-            "transcription": transcription,
+            "original_transcription": transcription,
+            "detected_language": detected_language,
+            "english_transcription": english_transcription,
             "final_score": final_score,
             "frames_data": frames_data,
             "text_analysis": {

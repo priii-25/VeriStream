@@ -92,7 +92,7 @@ const VideoAnalytics = () => {
       );
       setAnalysisResult(response.data);
     } catch (err) {
-      setError(err.response?.data?.error || 'An error occurred while analyzing the video.');
+      setError(err.response?.data?.detail || 'An error occurred while analyzing the video.');
       setAnalysisResult(null);
     } finally {
       setLoading(false);
@@ -100,7 +100,7 @@ const VideoAnalytics = () => {
   };
 
   const handleTranslate = async () => {
-    if (!analysisResult || !analysisResult.transcription) {
+    if (!analysisResult || !analysisResult.original_transcription) {
       setError('No transcription available to translate.');
       return;
     }
@@ -112,7 +112,7 @@ const VideoAnalytics = () => {
       const response = await axios.post(
         'http://127.0.0.1:5000/api/video/translate',
         {
-          transcription: analysisResult.transcription,
+          transcription: analysisResult.original_transcription,
           language: language,
         },
         {
@@ -191,11 +191,10 @@ const VideoAnalytics = () => {
     },
   };
 
-  // Dummy coordinates for locations (replace with actual geocoding if needed)
   const locations =
     analysisResult?.text_analysis?.locations?.map((loc) => ({
       name: loc.text,
-      latitude: 51.505, // Placeholder; use a geocoding API in production
+      latitude: 51.505, // Placeholder
       longitude: -0.09,
     })) || [];
 
@@ -235,8 +234,14 @@ const VideoAnalytics = () => {
           <h2>Analysis Results</h2>
 
           <div>
-            <strong>Transcription:</strong>{' '}
-            {analysisResult.transcription || 'No transcription available'}
+            <strong>Original Transcription ({analysisResult.detected_language}):</strong>{' '}
+            {analysisResult.original_transcription || 'No transcription available'}
+            {analysisResult.detected_language !== "en" && (
+              <div>
+                <strong>English Transcription:</strong>{' '}
+                {analysisResult.english_transcription}
+              </div>
+            )}
             <div>
               <select
                 value={language}
@@ -246,7 +251,6 @@ const VideoAnalytics = () => {
                 <option value="en">English</option>
                 <option value="es">Spanish</option>
                 <option value="fr">French</option>
-                {/* Indic Languages */}
                 <option value="hi">Hindi</option>
                 <option value="bn">Bengali</option>
                 <option value="ta">Tamil</option>
@@ -256,14 +260,13 @@ const VideoAnalytics = () => {
                 <option value="kn">Kannada</option>
                 <option value="ml">Malayalam</option>
                 <option value="pa">Punjabi</option>
-                {/* Additional Languages */}
                 <option value="de">German</option>
                 <option value="it">Italian</option>
                 <option value="zh">Chinese (Simplified)</option>
                 <option value="ja">Japanese</option>
                 <option value="ko">Korean</option>
               </select>
-              <button onClick={handleTranslate} disabled={loading || !analysisResult.transcription}>
+              <button onClick={handleTranslate} disabled={loading || !analysisResult.original_transcription}>
                 {loading ? 'Translating...' : 'Translate'}
               </button>
               {translation && (
