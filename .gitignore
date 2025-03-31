@@ -5,7 +5,6 @@ __pycache__/
 .db
 *.db
 /factcheck-env
-*/.json
 .Python
 build/
 develop-eggs/

@@ -369,8 +369,8 @@ const VideoAnalytics = () => {
               <strong>Text Analysis:</strong>
               <ul>
                 <li>
-                  Sentiment: {analysisResult.text_analysis.sentiment?.label || 'N/A'} (Score:{' '}
-                  {analysisResult.text_analysis.sentiment?.score?.toFixed(2) || 'N/A'})
+                  Political Bias: {analysisResult.text_analysis.political_bias?.label || 'N/A'} (Score:{' '}
+                  {analysisResult.text_analysis.political_bias?.score?.toFixed(2) || 'N/A'})
                 </li>
                 <li>
                   Manipulation Score:{' '}

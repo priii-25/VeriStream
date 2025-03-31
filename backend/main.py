@@ -405,7 +405,7 @@ async def analyze_video(file: UploadFile = File(...)):
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-            
+                       
 @app.get("/knowledge_graph")
 async def get_knowledge_graph():
     kg_html = "knowledge_graph.html"
