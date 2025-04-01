@@ -38,6 +38,7 @@ from sentence_transformers import SentenceTransformer
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
+from neo4j import GraphDatabase, basic_auth # Import Neo4j explicitly with auth
 
 # --- Configuration ---
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'; os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -52,6 +53,12 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# --- Neo4j Configuration ---
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "priyanshi") 
+NEO4J_DATABASE = "veristream" 
+
 # Clients
 groq_client = None
 if Groq and GROQ_API_KEY:
@@ -62,7 +69,7 @@ elif not GROQ_API_KEY: logging.warning("GROQ_API_KEY not found. LLM disabled.")
 
 # Models & Parameters
 EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
-DEVICE = 'cpu'
+DEVICE = 'cpu' # Or 'cuda' if GPU is available and configured
 LLM_PROVIDER = "Groq"
 LLM_MODEL_NAME = "llama3-8b-8192"
 NUM_SEARCH_RESULTS = 3 # Keep lower
@@ -161,7 +168,7 @@ Your JSON Response:
         except Exception as e: logging.error(f"LLM parse err: {e}. Resp: {llm_output_text}"); return {"final_label":"LLM Error", "explanation":f"LLM parse err: {llm_output_text}", "confidence":0.1}
     except APIConnectionError as e: logging.error(f"Groq ConnErr: {e}"); return {"final_label":"LLM Error", "explanation":f"API Conn Err: {e}", "confidence":0.1}
     except RateLimitError as e: logging.error(f"Groq RateLimit: {e}"); time.sleep(5); return {"final_label":"LLM Error", "explanation":f"API Rate Limit: {e}", "confidence":0.1}
-    except APIStatusError as e: logging.error(f"Groq Status {e.status_code}: {e.response}"); return {"final_label":"LLM Error", "explanation":f"API Status {e.status_code}", "confidence":0.1}
+    except APIStatusError as e: logging.error(f"Groq Status {e.status_code}: {e.response}"); return {"final_label":"LLM Error", "explanation":f"API Status {e.status_code}", "confidence": 0.1} # Corrected log message
     except Exception as e: logging.error(f"Unexpected Groq API err: {e}", exc_info=True); return {"final_label":"LLM Error", "explanation":f"API Err: {e}", "confidence":0.1}
 
 # --- Helper Functions ---
@@ -235,8 +242,197 @@ class FactChecker:
         self.claim_queue=queue.Queue(); self.results={}; self.results_lock=Lock(); self.shap_explanations=[]
         self.raw_fact_checks={}; self.raw_searches={}; self.claim_ner={}
 
+        # Neo4j Driver Initialization
+        self.neo4j_driver = None
+        try:
+            # Use basic_auth and specify database
+            self.neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=basic_auth(NEO4J_USER, NEO4J_PASSWORD))
+            # Verify connection and database existence
+            with self.neo4j_driver.session(database=NEO4J_DATABASE) as session:
+                session.run("MATCH (n) RETURN count(n) LIMIT 1") # Simple query to test connection
+            logging.info(f"Neo4j driver initialized for database '{NEO4J_DATABASE}'.")
+        except Exception as e:
+            logging.error(f"Failed to initialize Neo4j driver for URI '{NEO4J_URI}', DB '{NEO4J_DATABASE}': {e}")
+            self.neo4j_driver = None # Ensure driver is None if init fails
+
+
+    # --- UPDATED store_in_neo4j function ---
+    def store_in_neo4j(self, claim_data):
+        if not self.neo4j_driver:
+           logging.error("Neo4j driver not initialized. Cannot store data.")
+           return
+
+        claim = claim_data['original_claim']
+        preprocessed_claim = claim_data['preprocessed_claim']
+        final_verdict_str = claim_data['final_verdict'] # e.g., "True (Confidence: 0.90)"
+        final_explanation = claim_data['final_explanation']
+        confidence = 0.0
+        final_label = "Error" # Default label
+        try:
+            if '(Confidence: ' in final_verdict_str:
+                parts = final_verdict_str.split('(Confidence: ')
+                final_label = parts[0].strip() # e.g., "True" or "False"
+                confidence_str = parts[1][:-1] # Remove closing parenthesis
+                confidence = float(confidence_str)
+            else:
+                 final_label = final_verdict_str # Use the whole string if format is unexpected
+                 logging.warning(f"Could not parse confidence from final verdict string: '{final_verdict_str}'")
+        except Exception as e:
+            final_label = final_verdict_str # In case parsing fails, keep the original string
+            logging.warning(f"Could not parse confidence from final verdict string '{final_verdict_str}': {e}")
+
+
+        entities = claim_data.get('ner_entities', []) # Use .get for safety
+        initial_evidence = claim_data.get('initial_evidence', "")
+        rag_status = claim_data.get('rag_status', "")
+        initial_verdict_raw = claim_data.get('initial_verdict_raw', "")
+        factual_score = claim_data.get('factual_score', 0.0)
+
+        top_rag_snippets = claim_data.get('top_rag_snippets', []) # List of formatted snippet strings
+        timestamp = time.time()
+
+        # Use a session specific to the target database
+        with self.neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            tx = None # Initialize tx outside try
+            try:
+                tx = session.begin_transaction()
+
+                # 1. Create Claim node
+                # Returns the node object itself and its internal ID
+                claim_node_result = tx.run("""
+                    CREATE (c:Claim {
+                        text: $text,
+                        preprocessed_text: $preprocessed_text,
+                        timestamp: $timestamp,
+                        initial_verdict_raw: $initial_verdict_raw,
+                        rag_status: $rag_status,
+                        initial_evidence: $initial_evidence,
+                        factual_score: $factual_score
+                    })
+                    RETURN c, id(c) as claim_id
+                """,
+                                 text=claim, preprocessed_text=preprocessed_claim, timestamp=timestamp,
+                                 initial_verdict_raw=initial_verdict_raw, rag_status=rag_status,
+                                 initial_evidence=initial_evidence, factual_score=factual_score).single()
+
+                if not claim_node_result:
+                    raise Exception("Claim node creation failed.")
+
+                claim_node = claim_node_result['c']      # The actual node object
+                claim_node_id = claim_node_result['claim_id'] # The internal Neo4j ID
+
+                # 2. Create Verdict node
+                # Returns only the internal ID
+                verdict_node_result = tx.run("""
+                    CREATE (v:Verdict {
+                        verdict_label: $verdict_label,
+                        confidence: $confidence,
+                        explanation: $explanation
+                    })
+                    RETURN id(v) as verdict_id
+                    """, verdict_label=final_label, confidence=confidence, explanation=final_explanation).single()
+
+                if not verdict_node_result:
+                    raise Exception("Verdict node creation failed.")
+
+                verdict_id = verdict_node_result['verdict_id']
+
+                # 3. Link Claim to Verdict using the claim node object and verdict ID
+                tx.run("""
+                    MATCH (c), (v)
+                    WHERE id(c) = $claim_node_id AND id(v) = $verdict_id
+                    CREATE (c)-[:HAS_VERDICT]->(v)
+                    """, claim_node_id=claim_node_id, verdict_id=verdict_id)
+
+
+                # 4. Create and link EvidenceSnippet nodes
+                for i, snippet_formatted_string in enumerate(top_rag_snippets):
+                    source = "?" # Default source
+                    content = snippet_formatted_string # Default content if parsing fails
+                    try:
+                        # Example format: "Snip 1: \"Snippet text...\" (Source URL)"
+                        if '\" (' in snippet_formatted_string:
+                             parts = snippet_formatted_string.split('\" (')
+                             content_part = parts[0]
+                             source = parts[1][:-1] if len(parts)>1 else "?" # Extract source, remove last ')'
+                             # Extract content after "Snip X: " and remove quotes
+                             if ': "' in content_part:
+                                 content = content_part.split(': "', 1)[1]
+                             else: # Fallback if format slightly different
+                                 content = content_part
+                        else:
+                             logging.warning(f"Could not parse snippet format: '{snippet_formatted_string}'")
+                             content = snippet_formatted_string # Keep original if parse fails
+                    except Exception as e:
+                        logging.warning(f"Snippet parsing failed for: '{snippet_formatted_string}' - {e}")
+                        content = snippet_formatted_string # Keep original on error
+
+                    # Create EvidenceSnippet node
+                    evidence_snippet_node_result = tx.run("""
+                        CREATE (es:EvidenceSnippet {
+                            content: $content,
+                            source: $source,
+                            snippet_index: $snippet_index
+                        })
+                        RETURN id(es) as snippet_id
+                        """, content=content, source=source, snippet_index=i).single()
+
+                    if evidence_snippet_node_result:
+                        evidence_snippet_id = evidence_snippet_node_result['snippet_id']
+                        # Link Claim to EvidenceSnippet using claim node object and snippet ID
+                        tx.run("""
+                            MATCH (c), (es)
+                            WHERE id(c) = $claim_node_id AND id(es) = $evidence_snippet_id
+                            CREATE (c)-[:HAS_EVIDENCE]->(es)
+                            """, claim_node_id=claim_node_id, evidence_snippet_id=evidence_snippet_id)
+                    else:
+                         logging.warning(f"Failed to create EvidenceSnippet node for snippet index {i}")
+
+
+                # 5. Create and link Entity nodes
+                for entity in entities:
+                    entity_text = entity.get('text')
+                    entity_label = entity.get('label')
+                    if not entity_text or not entity_label:
+                        logging.warning(f"Skipping invalid entity data: {entity}")
+                        continue
+
+                    # Merge Entity node (create if not exists)
+                    entity_node_result = tx.run("""
+                        MERGE (e:Entity {text: $text, label: $label})
+                        RETURN id(e) as entity_id
+                        """, text=entity_text, label=entity_label).single()
+
+                    if entity_node_result:
+                        entity_id = entity_node_result['entity_id']
+                        # Link Claim to Entity using claim node object and entity ID
+                        tx.run("""
+                            MATCH (c), (e)
+                            WHERE id(c) = $claim_node_id AND id(e) = $entity_id
+                            MERGE (c)-[:MENTIONS]->(e)
+                            """, claim_node_id=claim_node_id, entity_id=entity_id) # Use MERGE for idempotency
+                    else:
+                        logging.warning(f"Failed to merge Entity node for: {entity_text} ({entity_label})")
+
+
+                tx.commit()
+                logging.info(f"Stored claim '{claim}' in Neo4j (DB: {NEO4J_DATABASE}) with new granular schema.")
+
+            except Exception as e:
+                if tx:
+                    logging.error(f"Transaction failed for claim '{claim}'. Rolling back.")
+                    try:
+                        tx.rollback()
+                    except Exception as rb_e:
+                         logging.error(f"Error during rollback: {rb_e}")
+                # Log the specific error leading to the rollback
+                logging.error(f"Error storing claim '{claim}' in Neo4j (DB: {NEO4J_DATABASE}) with new schema: {e}", exc_info=True)
+            # finally: # Session is closed automatically by 'with' statement
+            #     pass
+
+    # --- End UPDATED store_in_neo4j function ---
+
     def preprocess_and_filter(self, text: str) -> (list, list):
-        # (Same as before)
         if not text or not isinstance(text, str): logging.warning("Preprocess: Input empty."); return [], []
         sentences = []; checkable_claims_data = []; non_checkable_claims = []
         try:
@@ -255,7 +451,6 @@ class FactChecker:
         return checkable_claims_data, non_checkable_claims
 
     def classify_and_prioritize_claims(self, checkable_claims_data: list) -> list:
-        # (Same as before)
         if not checkable_claims_data: logging.warning("Prioritize: No data."); return []
         try:
             orig=[cd["original_claim"] for cd in checkable_claims_data]; embeds=self.embedding_model.encode(orig,convert_to_tensor=True,show_progress_bar=False)
@@ -266,13 +461,12 @@ class FactChecker:
         except Exception as e: logging.error(f"Prioritization error: {e}",exc_info=True); return []
 
     def add_claims_to_queue(self, claims_to_process: list):
-        # (Same as before)
         if not claims_to_process: logging.warning("Queue: No claims."); return
         for cd_dict in claims_to_process: self.claim_queue.put(cd_dict)
         logging.info(f"Queued {len(claims_to_process)} claims. Size: {self.claim_queue.qsize()}")
 
     def process_claim(self, claim_data_dict: dict):
-        """Pipeline: GFactCheck(prep) -> GCustomSearch(prep) -> RAG(orig) -> LLM Verdict(orig, RAG)."""
+        """Pipeline: GFactCheck(prep) -> GCustomSearch(prep) -> RAG(orig) -> LLM Verdict(orig, RAG) -> Neo4j Store."""
         original_claim = claim_data_dict['original_claim']; preprocessed_claim = claim_data_dict['preprocessed_claim']
         ner_entities = claim_data_dict['ner_entities']; start_time = time.time()
         logging.info(f"Processing: \"{original_claim}\" (API Query: \"{preprocessed_claim}\")")
@@ -282,7 +476,8 @@ class FactChecker:
             "factual_score": claim_data_dict.get('score', None),
             "initial_verdict_raw": "N/A", "initial_evidence": "N/A", # Step 1 result
             "rag_status": "Not Attempted", "top_rag_snippets": [], # Step 2/3 results
-            "final_verdict": "Pending", "final_explanation": "N/A" # Step 4 results (LLM)
+            "final_verdict": "Pending", "final_explanation": "N/A", # Step 4 results (LLM)
+            # top_rag_snippets initialized above
         }
         rag_evidence_for_llm = [] # Data for LLM
 
@@ -310,14 +505,30 @@ class FactChecker:
         if search_results:
             documents=[]; vector_store=None
             try:
-                sig_words={w.lower() for w in preprocessed_claim.split() if len(w)>3}; documents=[Document(page_content=sr['snippet'],metadata={'source':sr['link'],'title':sr['title']}) for sr in search_results if any(w in sr['snippet'].lower() for w in sig_words)]
+                # Simple relevance check: preprocessed words in snippet
+                sig_words={w.lower() for w in preprocessed_claim.split() if len(w)>3};
+                documents=[Document(page_content=sr['snippet'],metadata={'source':sr['link'],'title':sr['title']}) for sr in search_results if any(w in sr['snippet'].lower() for w in sig_words)]
+
                 if documents:
                     vector_store=FAISS.from_documents(documents,self.langchain_embeddings); logging.debug("FAISS index OK.")
-                    retrieved_docs=vector_store.similarity_search(original_claim, k=RAG_K); rag_evidence_for_llm=[{"content":doc.page_content,"metadata":doc.metadata} for doc in retrieved_docs]
-                    result['top_rag_snippets']=[f"Snip {j+1}: \"{d['content'][:100]}...\" ({d['metadata'].get('source','?')})" for j,d in enumerate(rag_evidence_for_llm)] # Shorter snippets
-                    result["rag_status"] = f"RAG OK ({len(rag_evidence_for_llm)} snippets)"
-                else: result["rag_status"] = "Search OK, No Relevant Docs for Index"
-            except Exception as e: logging.error(f"RAG fail: {e}",exc_info=False); result["rag_status"]=f"RAG Failed ({type(e).__name__})"; rag_evidence_for_llm=[]; result['top_rag_snippets']=[]
+                    retrieved_docs=vector_store.similarity_search(original_claim, k=RAG_K);
+                    rag_evidence_for_llm=[{"content":doc.page_content,"metadata":doc.metadata} for doc in retrieved_docs]
+                    # Store formatted snippets for Neo4j and display
+                    result['top_rag_snippets']=[f"Snip {j+1}: \"{d['content'][:150].strip()}...\" ({d['metadata'].get('source','?')})" for j,d in enumerate(rag_evidence_for_llm)] # Slightly longer snippet preview
+                    result["rag_status"] = f"RAG OK ({len(rag_evidence_for_llm)} snippets retrieved)"
+                else:
+                    result["rag_status"] = "Search OK, No Relevant Docs for Index"
+                    result['top_rag_snippets']=[]
+                    rag_evidence_for_llm=[]
+            except Exception as e:
+                logging.error(f"RAG fail: {e}",exc_info=False);
+                result["rag_status"]=f"RAG Failed ({type(e).__name__})"
+                rag_evidence_for_llm=[]
+                result['top_rag_snippets']=[]
+        else: # Handle case where search didn't yield results
+             result["rag_status"] = result.get("rag_status", "Search Returned No Results") # Keep previous status if it was an error
+             rag_evidence_for_llm = []
+             result['top_rag_snippets'] = []
 
         # --- Step 4: LLM Final Verdict from RAG ---
         logging.info(f"LLM generating final verdict for '{original_claim}' from RAG...");
@@ -329,36 +540,44 @@ class FactChecker:
         result['final_verdict'] = f"{llm_final_result['final_label']} (Confidence: {llm_final_result['confidence']:.2f})"
         result['final_explanation'] = llm_final_result['explanation'] # LLM's justification based on RAG
 
+        # --- Step 5: Store in Neo4j ---
+        try:
+            self.store_in_neo4j(result) # Call the updated function
+        except Exception as neo4j_e:
+            # Log error but continue processing other claims
+            logging.error(f"Neo4j storage failed for claim '{original_claim}': {neo4j_e}", exc_info=True)
+
+
         processing_time = time.time() - start_time
         logging.info(f"Final Verdict for '{original_claim}': {result['final_verdict']}. (RAG-LLM Explain: {result['final_explanation']}). (Time:{processing_time:.2f}s)")
         with self.results_lock: self.results[original_claim] = result # Store final result keyed by original claim
 
     def worker(self):
-        # (Worker logic same)
         t_obj=current_thread(); t_name=t_obj.name; logging.info(f"W {t_name} start.")
         while True:
             cd_dict=None
             try: cd_dict=self.claim_queue.get(timeout=1); self.process_claim(cd_dict); self.claim_queue.task_done()
             except queue.Empty: logging.info(f"W {t_name} empty."); break
             except Exception as e:
-                orig_claim=cd_dict.get('original_claim','?') if cd_dict else '?'; logging.error(f"W {t_name} err '{orig_claim}': {e}",exc_info=True)
+                orig_claim=cd_dict.get('original_claim','?') if cd_dict else '?'; logging.error(f"W {t_name} err processing claim '{orig_claim}': {e}",exc_info=True)
                 if cd_dict:
                     with self.results_lock: self.results[orig_claim]={"original_claim":orig_claim,"final_verdict":"Processing Error","final_explanation":f"Worker error: {e}"} # Store error
-                    self.claim_queue.task_done()
+                    try:
+                        self.claim_queue.task_done() # Mark task done even on error
+                    except ValueError: pass # If already marked done elsewhere?
         logging.info(f"W {t_name} finish.")
 
     def train_and_run_shap(self, checkable_claims_data: list):
-        # (SHAP logic same - uses original_claim from dict)
         if not self.shap_available: logging.warning("SHAP unavailable."); self.shap_explanations = [{"claim":cd.get('original_claim', '?'),"shap_values":"[SHAP Unavailable]"} for cd in checkable_claims_data]; return
         logging.info("Attempting SHAP explanations...");
         valid_claims_data = [cd for cd in checkable_claims_data if cd.get("original_claim")]
         if not valid_claims_data: logging.warning("No valid claims data for SHAP."); self.shap_explanations=[]; return
         sentences = [cd['original_claim'] for cd in valid_claims_data]
         if not sentences: logging.warning("No sentences extracted for SHAP."); self.shap_explanations=[]; return
-        embed_dim_fallback=384; 
-        try: 
+        embed_dim_fallback=384;
+        try:
             embed_dim_fallback=self.embedding_model.get_sentence_embedding_dimension()
-        except: 
+        except:
             logging.warning("No emb dim.")
         self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":"[SHAP Pending]" if embed_dim_fallback>0 else "[SHAP Err Dim]"} for cd in valid_claims_data]
         try:
@@ -370,10 +589,14 @@ class FactChecker:
                  scs=[];
                  for e in np_embeds: r=float(np.linalg.norm(e)); s=0.5+(r/(r*25+1e-6)) if r>0 else 0.5; scs.append(min(max(s,0.0),1.0))
                  return np.array(scs)
-            if not isinstance(embeddings,np.ndarray) or embeddings.ndim!=2 or embeddings.shape[0]<2: logging.error(f"Invalid embeds SHAP."); self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":"[SHAP Embed Err]"} for cd in valid_claims_data]; return
+            if not isinstance(embeddings,np.ndarray) or embeddings.ndim!=2 or embeddings.shape[0]<1: # Allow single instance
+                logging.error(f"Invalid embeds for SHAP: shape={embeddings.shape if isinstance(embeddings, np.ndarray) else type(embeddings)}. Need 2D numpy array.");
+                self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":"[SHAP Embed Err]"} for cd in valid_claims_data]; return
             embed_dim=embeddings.shape[1]; logging.debug("Creating SHAP bg..."); bg_obj=None
             try:
-                 n_c=min(10,embeddings.shape[0]); bg_obj=shap.kmeans(embeddings,n_c) if n_c>1 else embeddings
+                 # Handle case with fewer samples than clusters (use embeddings directly)
+                 n_c=min(10,embeddings.shape[0]);
+                 bg_obj=shap.kmeans(embeddings,n_c) if embeddings.shape[0] >= n_c and n_c > 1 else embeddings
                  bg_data=None
                  if hasattr(bg_obj,'data') and isinstance(getattr(bg_obj,'data',None),np.ndarray): bg_data=bg_obj.data; logging.debug("Got .data from SHAP bg.")
                  elif isinstance(bg_obj,np.ndarray): bg_data=bg_obj; logging.debug("Using np array for SHAP bg.")
@@ -385,15 +608,19 @@ class FactChecker:
             logging.info(f"Calculating SHAP vals ({embeddings.shape[0]} inst)..."); shap_vals=explainer.shap_values(embeddings,nsamples=50)
             logging.info("SHAP vals calculated.")
             calc_expl=[]
-            if shap_vals is not None and len(shap_vals)==len(sentences):
+            # Handle scalar SHAP value output for single instance
+            if isinstance(shap_vals, np.ndarray) and shap_vals.ndim == 1 and len(sentences) == 1:
+                 calc_expl.append({"claim":sentences[0],"shap_values":shap_vals.tolist()})
+                 logging.info(f"SHAP stored for 1 claim.")
+                 self.shap_explanations = calc_expl
+            elif isinstance(shap_vals, np.ndarray) and shap_vals.ndim == 2 and shap_vals.shape[0] == len(sentences):
                 for i,ct in enumerate(sentences): calc_expl.append({"claim":ct,"shap_values":shap_vals[i].tolist()}) # Use original claim
                 logging.info(f"SHAP stored for {len(calc_expl)} claims.")
                 self.shap_explanations=calc_expl # Success
-            else: logging.error(f"SHAP vals mismatch/None."); self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Calc Err]"} for cd in valid_claims_data]
+            else: logging.error(f"SHAP vals mismatch/None. Got shape {shap_vals.shape if isinstance(shap_vals,np.ndarray) else type(shap_vals)}, expected ({len(sentences)}, {embed_dim}) or ({embed_dim},) for single."); self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Calc Err Shape]"} for cd in valid_claims_data]
         except Exception as e: logging.error(f"SHAP gen error: {e}",exc_info=True); final_dim=embed_dim if 'embed_dim' in locals() else embed_dim_fallback; self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Error: {type(e).__name__}]" if final_dim==0 else [0.0]*final_dim} for cd in valid_claims_data]
 
     def generate_chain_of_thought(self, checkable_claims_data: list, non_checkable_claims: list) -> str:
-        # (CoT updated for new pipeline)
         cot = ["Chain of Thought Summary:"]
         cot.append("1. Preprocessed: Segmented, Filtered, NER, Simplified checkable claims for API.")
         if non_checkable_claims: cot.append(f"   - Filtered Non-Checkable ({len(non_checkable_claims)}): {non_checkable_claims}")
@@ -410,6 +637,13 @@ class FactChecker:
                     cot.append(f"     - RAG Status (using '{res.get('preprocessed_claim','?')}'): {res.get('rag_status','?')}")
                     cot.append(f"     - LLM Final Verdict (based on RAG for original claim '{claim}'): {res.get('final_verdict','?')}")
                     cot.append(f"     - LLM Justification: {res.get('final_explanation','?')}")
+                    # Indicate Neo4j storage attempt
+                    if self.neo4j_driver:
+                        # Simple indicator, actual success/failure logged elsewhere
+                        cot.append(f"     - Neo4j Storage: Attempted (Check logs for status)")
+                    else:
+                        cot.append(f"     - Neo4j Storage: Skipped (Driver not initialized)")
+
                 else: cot.append(f"   - Claim {i+1}: '{claim}' -> Result Missing!")
         cot.append("3. Generated SHAP for checkable claims' classification scores (if available/successful).")
         # (SHAP summary logic same)
@@ -448,9 +682,14 @@ class FactChecker:
             logging.info(f"Starting {n_workers} workers...");
             for i in range(n_workers): t=Thread(target=self.worker,name=f"Worker-{i+1}",daemon=True); t.start(); threads.append(t)
             self.claim_queue.join(); logging.info("Workers finished.")
-        else: logging.info("No claims queued.")
+        else: logging.info("No claims queued, processing skipped.")
 
-        # --- Intermediate Output Moved to Main ---
+        # Ensure all threads are finished before proceeding (join might return early if queue empty)
+        for t in threads:
+            t.join(timeout=5.0) # Wait a bit longer if needed
+            if t.is_alive():
+                 logging.warning(f"Thread {t.name} still alive after join timeout.")
+
 
         # 5. Generate SHAP (after processing)
         logging.info("Step 5: Generating SHAP (if installed)..."); self.train_and_run_shap(claims_to_process)
@@ -458,6 +697,10 @@ class FactChecker:
         # 6. Consolidate Results (Final results dict generation)
         logging.info("Step 6: Consolidating final results..."); results_list=[]; ok_count=0; err_count=0
         with self.results_lock:
+            # Ensure results are populated after workers finish
+            processed_claims_keys = list(self.results.keys())
+            logging.debug(f"Keys in self.results after workers: {processed_claims_keys}")
+
             for cd in claims_to_process: # Iterate through original list of dicts
                  original_claim = cd['original_claim']
                  res = self.results.get(original_claim) # Fetch processed result
@@ -465,13 +708,24 @@ class FactChecker:
                       results_list.append(res); ok_count+=1
                       # Count errors based on final verdict state
                       if res.get("final_verdict", "").startswith(("Error","LLM Error","Processing Error","Missing")): err_count+=1
-                 else: logging.error(f"Result missing: '{original_claim}'."); results_list.append({"original_claim":original_claim,"final_verdict":"Missing Result","final_explanation":"Result lost during processing."}); err_count+=1
+                 else: logging.error(f"Result missing: '{original_claim}'. Adding error entry."); results_list.append({"original_claim":original_claim,"final_verdict":"Missing Result","final_explanation":"Result lost during processing."}); err_count+=1
 
         summary=self.generate_chain_of_thought(claims_to_process, non_checkable_sents) # Generate CoT summary
         duration = time.time() - start
         logging.info(f"Check complete. Processed {ok_count} checkable claims ({err_count} errors) in {duration:.2f}s.")
         # Return all relevant data structures
         return {"processed_claims":results_list, "non_checkable_claims":non_checkable_sents, "summary":summary, "raw_fact_checks":self.raw_fact_checks, "raw_searches":self.raw_searches, "shap_explanations": self.shap_explanations} # Return SHAP results too
+
+    def close_neo4j(self):
+        """Closes the Neo4j driver connection."""
+        if self.neo4j_driver:
+            try:
+                self.neo4j_driver.close()
+                logging.info("Neo4j driver closed.")
+            except Exception as e:
+                logging.error(f"Error closing Neo4j driver: {e}")
+
+
 # --- End FactChecker Class ---
 
 # --- Main Execution Block ---
@@ -489,6 +743,18 @@ if __name__ == "__main__":
     print("Fact Checker Initializing...")
     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID: logging.critical("CRIT: Google keys missing."); print("\nCRIT ERR: Google keys missing."); exit(1)
     else: logging.info("Google keys loaded.")
+    if not NEO4J_PASSWORD: logging.critical("CRIT: NEO4J_PASSWORD missing."); print("\nCRIT ERR: Neo4j password missing."); exit(1)
+
+    checker = None # Initialize checker outside try
+    try:
+        checker = FactChecker()
+        if checker.neo4j_driver is None:
+            print("\nCRIT ERR: Neo4j driver failed to initialize. Check URI, credentials, and DB name. Exiting.")
+            exit(1)
+        print("Fact Checker Initialized Successfully.")
+    except RuntimeError as e: logging.critical(f"Init fail: {e}",exc_info=True); print(f"\nCRIT ERR: Init failed. Logs:{log_file}. Err:{e}"); exit(1)
+    except Exception as e: logging.critical(f"Unexpected init err: {e}",exc_info=True); print(f"\nCRIT UNEXPECTED init err. Logs:{log_file}. Err:{e}"); exit(1)
+
 
     input_text = (
         "The Earth is flat according to the Flat Earth Society. The moon is made of green cheese, isn't it? "
@@ -500,14 +766,11 @@ if __name__ == "__main__":
     )
     print(f"\nInput Text:\n{input_text}\n")
 
-    try: checker = FactChecker(); print("Fact Checker Initialized Successfully.")
-    except RuntimeError as e: logging.critical(f"Init fail: {e}",exc_info=True); print(f"\nCRIT ERR: Init failed. Logs:{log_file}. Err:{e}"); exit(1)
-    except Exception as e: logging.critical(f"Unexpected init err: {e}",exc_info=True); print(f"\nCRIT UNEXPECTED init err. Logs:{log_file}. Err:{e}"); exit(1)
 
     print("\n--- Starting Fact Check Pipeline ---\n")
     results_data = checker.check(input_text, num_workers=2) # checker.check now returns the final dict
 
-    # --- NEW OUTPUT ORDER ---
+    # --- OUTPUT ORDER ---
 
     # 1. Raw Fact Check API Results
     print("\n" + "="*25 + " Intermediate Output 1: Raw Google Fact Check API Results " + "="*15)
@@ -553,11 +816,19 @@ if __name__ == "__main__":
             ner_ents = res.get('ner_entities', [])
             if ner_ents: print(f"  - NER Entities: {', '.join([f'{e['text']}({e['label']})' for e in ner_ents])}")
             else: print("  - NER Entities: None Found")
+            print(f"  - Factual Score (0-1): {res.get('factual_score'):.2f}" if res.get('factual_score') is not None else "N/A")
             print(f"  - Initial Check Result: '{res.get('initial_verdict_raw','?')}'")
             print(f"  - RAG Status: {res.get('rag_status', '?')}")
             if res.get('top_rag_snippets'): print("  - Top RAG Snippets:"); [print(f"    {j+1}. {snip}") for j,snip in enumerate(res.get('top_rag_snippets',[]))]
+            else: print("  - Top RAG Snippets: None")
             print(f"  - Final Verdict (RAG+LLM): {res.get('final_verdict', '?')}") # Emphasize source
             print(f"  - LLM Justification: {res.get('final_explanation', '?')}")
+            # Indicate Neo4j storage status based on logs
+            if checker and checker.neo4j_driver:
+                 print(f"  - Neo4j Storage: Attempted (Check logs & DB '{NEO4J_DATABASE}')")
+            else:
+                 print("  - Neo4j Storage: Skipped (Driver not available)")
+
     else: print("No checkable claims were processed or results available.")
     print("="*83)
 
@@ -569,8 +840,8 @@ if __name__ == "__main__":
              v=expl.get('shap_values',[]); s="[Err/Unavail]"
              if isinstance(v,list) and v:
                  if all(isinstance(x,(int,float)) for x in v): s=f"[...{len(v)} values]" if not all(abs(y)<1e-9 for y in v) else "[Err Fallback]"; has_real=True if s.startswith("[...") else has_real
-                 else: s=str(v)
-             elif isinstance(v,str): s=v
+                 else: s=str(v) # Display list content if not numbers
+             elif isinstance(v,str): s=v # Handle string error messages like "[SHAP Embed Err]"
              elif not v: s="[No Data]"
              shap_summary.append(f"'{expl.get('claim','?')}': {s}")
          status = "Generated." if has_real else "Failed/Unavailable."
@@ -578,7 +849,7 @@ if __name__ == "__main__":
          if shap_summary: print(f"  - Details: {{{', '.join(shap_summary)}}}")
          # Add reminder to check log file for errors
          if not has_real and shap is not None:
-              if any("[SHAP Error" in str(expl.get("shap_values","")) for expl in results_data["shap_explanations"]):
+              if any("[SHAP Error" in str(expl.get("shap_values","")) or "[SHAP Embed Err]" in str(expl.get("shap_values","")) for expl in results_data.get("shap_explanations", [])):
                    print(f"\n  *** SHAP Error Detected: Check '{log_file}' for traceback. ***")
     else: print("  - SHAP analysis skipped or no results structure.")
     print("="*86)
@@ -588,3 +859,9 @@ if __name__ == "__main__":
     print(results_data.get("summary", "No summary generated."))
     print("="*86)
     print(f"\nLog file generated at: {log_file}")
+
+    # Close Neo4j connection cleanly
+    if checker:
+        checker.close_neo4j()
+
+    print("\nScript finished.")
