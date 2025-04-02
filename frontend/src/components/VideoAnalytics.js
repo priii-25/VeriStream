@@ -60,7 +60,7 @@ const VideoAnalytics = () => {
   };
 
   useEffect(() => {
-    wsRef.current = new WebSocket('ws://127.0.0.1:5000/api/video/progress');
+    wsRef.current = new WebSocket('ws://127.0.0.1:5001/api/video/progress');
     wsRef.current.onopen = () => console.log('WebSocket connected for progress');
     wsRef.current.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -86,7 +86,7 @@ const VideoAnalytics = () => {
 
     try {
       const response = await axios.post(
-        'http://127.0.0.1:5000/api/video/analyze',
+        'http://127.0.0.1:5001/api/video/analyze',
         formData,
         { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 180000 }
       );
@@ -110,7 +110,7 @@ const VideoAnalytics = () => {
 
     try {
       const response = await axios.post(
-        'http://127.0.0.1:5000/api/video/translate',
+        'http://127.0.0.1:5001/api/video/translate',
         {
           transcription: analysisResult.original_transcription,
           language: language,
@@ -339,11 +339,118 @@ const VideoAnalytics = () => {
             </div>
           )}
 
+          {analysisResult.text_analysis?.fact_check_result && (
+            <div style={{ marginTop: '20px' }}>
+              <h3>Fact Check Analysis</h3>
+
+              {/* Raw Google Fact Check API Results */}
+              <div>
+                <h4>Raw Google Fact Check API Results</h4>
+                {analysisResult.text_analysis.fact_check_result.raw_fact_checks &&
+                Object.keys(analysisResult.text_analysis.fact_check_result.raw_fact_checks).length > 0 ? (
+                  Object.entries(analysisResult.text_analysis.fact_check_result.raw_fact_checks).map(([claim, results], idx) => (
+                    <div key={idx}>
+                      <p><strong>Claim:</strong> "{claim}"</p>
+                      <ul>
+                        {results.map((res, i) => (
+                          <li key={i}>Verdict: {res.verdict} | Evidence: {res.evidence}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))
+                ) : (
+                  <p>No raw fact check data available.</p>
+                )}
+              </div>
+
+              {/* Filtered Non-Checkable Sentences */}
+              <div style={{ marginTop: '10px' }}>
+                <h4>Filtered Non-Checkable Sentences</h4>
+                {analysisResult.text_analysis.fact_check_result.non_checkable_claims?.length > 0 ? (
+                  <ul>
+                    {analysisResult.text_analysis.fact_check_result.non_checkable_claims.map((sentence, idx) => (
+                      <li key={idx}>"{sentence}"</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>No sentences were filtered out.</p>
+                )}
+              </div>
+
+              {/* Processed Claim Details */}
+              <div style={{ marginTop: '10px' }}>
+                <h4>Processed Claim Details</h4>
+                {analysisResult.text_analysis.fact_check_result.processed_claims?.length > 0 ? (
+                  analysisResult.text_analysis.fact_check_result.processed_claims.map((claim, idx) => (
+                    <div key={idx} style={{ marginBottom: '10px' }}>
+                      <p><strong>Claim {idx + 1} (Original):</strong> "{claim.original_claim}" [Source: {claim.source}]</p>
+                      <p>Preprocessed: "{claim.preprocessed_claim}"</p>
+                      {claim.source === "Knowledge Graph" ? (
+                        <>
+                          <p>Final Verdict (From KG): {claim.final_verdict}</p>
+                          <p>KG Explanation: {claim.final_explanation}</p>
+                          {claim.kg_timestamp && (
+                            <p>KG Timestamp: {new Date(claim.kg_timestamp * 1000).toLocaleString()}</p>
+                          )}
+                        </>
+                      ) : claim.source === "Full Pipeline" ? (
+                        <>
+                          <p>NER Entities: {claim.ner_entities.length > 0 ? claim.ner_entities.map(e => `${e.text} (${e.label})`).join(', ') : 'None'}</p>
+                          <p>Factual Score: {claim.factual_score?.toFixed(2) || 'N/A'}</p>
+                          <p>Initial Check: {claim.initial_verdict_raw}</p>
+                          <p>RAG Status: {claim.rag_status}</p>
+                          {claim.top_rag_snippets.length > 0 && (
+                            <div>
+                              <p>Top RAG Snippets:</p>
+                              <ul>
+                                {claim.top_rag_snippets.map((snippet, i) => (
+                                  <li key={i}>{snippet}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          <p>Final Verdict (RAG+LLM): {claim.final_verdict}</p>
+                          <p>LLM Justification: {claim.final_explanation}</p>
+                        </>
+                      ) : (
+                        <p>Error: {claim.final_explanation}</p>
+                      )}
+                    </div>
+                  ))
+                ) : (
+                  <p>No processed claims available.</p>
+                )}
+              </div>
+
+              {/* SHAP Explanations */}
+              <div style={{ marginTop: '10px' }}>
+                <h4>XAI (SHAP) Summary</h4>
+                {analysisResult.text_analysis.fact_check_result.shap_explanations?.length > 0 ? (
+                  <ul>
+                    {analysisResult.text_analysis.fact_check_result.shap_explanations.map((ex, idx) => (
+                      <li key={idx}>
+                        "{ex.claim}": {typeof ex.shap_values === 'string' ? ex.shap_values : '[SHAP Values Available]'}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>SHAP analysis skipped or no results.</p>
+                )}
+              </div>
+
+              {/* Chain of Thought Summary */}
+              <div style={{ marginTop: '10px' }}>
+                <h4>Chain of Thought Summary</h4>
+                <pre style={{ whiteSpace: 'pre-wrap' }}>{analysisResult.text_analysis.fact_check_result.summary || 'No summary available.'}</pre>
+              </div>
+            </div>
+          )}
+
           {analysisResult.text_analysis?.knowledge_graph && (
             <div style={{ marginTop: '20px' }}>
               <h3>Knowledge Graph</h3>
               <iframe
-                src="http://127.0.0.1:5000/knowledge_graph"
+                src="http://127.0.0.1:5001/knowledge_graph"
                 style={{ width: '100%', height: '400px', border: 'none' }}
                 title="Knowledge Graph"
               />
@@ -399,12 +506,6 @@ const VideoAnalytics = () => {
                   ) : (
                     ' None'
                   )}
-                </li>
-                <li>
-                  Fact Checks:{' '}
-                  {analysisResult.text_analysis.fact_checks?.length > 0
-                    ? JSON.stringify(analysisResult.text_analysis.fact_checks)
-                    : 'None'}
                 </li>
               </ul>
             </div>

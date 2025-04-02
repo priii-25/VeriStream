@@ -10,7 +10,7 @@ from spark_video_processor import SparkVideoProcessor
 from optimized_deepfake_detector import OptimizedDeepfakeDetector
 from streamlink import Streamlink
 from knowledge_graph import KnowledgeGraphManager
-#from fact_checker import FactCheckManager, fact_check_text
+from fact_checker import FactChecker
 import cv2
 import numpy as np
 import asyncio
@@ -47,7 +47,7 @@ app.add_middleware(
 video_producer = VideoProducer()
 video_analyzer = VideoAnalyzer()
 text_analyzer = OptimizedAnalyzer(use_gpu=True)
-#fact_checker = FactCheckManager(api_key=FACT_CHECK_API_KEY)
+fact_checker = FactChecker()
 spark_processor = SparkVideoProcessor()
 session = Streamlink()
 is_running = False
@@ -212,19 +212,17 @@ async def process_stream(stream_url):
                 fact_check_buffer_first += " " + english_transcription_first
                 fact_check_buffer_second += " " + english_transcription_second
 
-                if fact_check_buffer_first.strip():
-                    #fact_check_results.extend(fact_check_text(fact_check_buffer_first, fact_checker))
-                    fact_check_results.append({"verdict": "Pending", "evidence": fact_check_buffer_first})
-                    fact_check_buffer_first = ""
-                else:
-                    fact_check_results.append({"verdict": "No claims", "evidence": "No transcription available for first half"})
+                async def run_fact_check(text):
+                    if not text.strip():
+                        return {"processed_claims": [], "non_checkable_claims": [], "summary": "Empty transcription", "raw_fact_checks": {}, "raw_searches": {}, "shap_explanations": []}
+                    return await asyncio.to_thread(fact_checker.check, text, num_workers=2)
 
+                if fact_check_buffer_first.strip():
+                    fact_check_results.extend(await run_fact_check(fact_check_buffer_first))
+                    fact_check_buffer_first = ""
                 if fact_check_buffer_second.strip():
-                    #fact_check_results.extend(fact_check_text(fact_check_buffer_second, fact_checker))
-                    fact_check_results.append({"verdict": "Pending", "evidence": fact_check_buffer_second})
+                    fact_check_results.extend(await run_fact_check(fact_check_buffer_second))
                     fact_check_buffer_second = ""
-                else:
-                    fact_check_results.append({"verdict": "No claims", "evidence": "No transcription available for second half"})
 
                 last_fact_check_time = current_time
 
@@ -246,7 +244,7 @@ async def process_stream(stream_url):
                             "english": english_transcription_second
                         }
                     },
-                    "fact_checks": fact_check_results
+                    "fact_check_results": fact_check_results
                 }
                 await result_queue.put(result)
 
@@ -410,11 +408,13 @@ async def analyze_video(file: UploadFile = File(...)):
         
         # Get transcription and detected language (now returns 4 values)
         transcription, final_score, frames_data, detected_language = video_analyzer.analyze_video(temp_path, None)
+        english_transcription = await translate_to_english(transcription, detected_language)
         await broadcast_progress(0.3)
         
-        # Translate to English if not already in English
-        english_transcription = await translate_to_english(transcription, detected_language)
-        
+        fact_check_result = await asyncio.to_thread(fact_checker.check, english_transcription, num_workers=2)
+        processed_claims = fact_check_result["processed_claims"]
+        fact_checks = [{"verdict": p["final_verdict"], "evidence": p["final_explanation"]} for p in processed_claims]
+      
         # Analyze the English transcription
         analysis_result = await text_analyzer.analyze_text(english_transcription)
         await broadcast_progress(0.6)
@@ -434,13 +434,15 @@ async def analyze_video(file: UploadFile = File(...)):
         await broadcast_progress(1.0)
 
         kg_manager = KnowledgeGraphManager()
-        if isinstance(analysis_result.knowledge_graph, dict):
-            for node, data in analysis_result.knowledge_graph['nodes']:
-                kg_manager.graph.add_node(node, **data)
-            for edge in analysis_result.knowledge_graph['edges']:
-                kg_manager.graph.add_edge(edge[0], edge[1], **edge[2])
-        else:
-            kg_manager.graph = analysis_result.knowledge_graph
+        for claim in processed_claims:
+            entities = [{"text": e["text"], "type": e["label"]} for e in claim.get("ner_entities", [])]
+            kg_fact_checks = [{"claimReview": [{"textualRating": claim["final_verdict"], "url": claim.get("source", "N/A")}]}]
+            kg_manager.add_fact(
+                claim["original_claim"],
+                entities,
+                kg_fact_checks,
+                analysis_result.political_bias  
+            )
         kg_manager.visualize_graph("knowledge_graph.html")
 
         response = {
@@ -451,7 +453,7 @@ async def analyze_video(file: UploadFile = File(...)):
             "frames_data": frames_data,
             "text_analysis": {
                 "political_bias": analysis_result.political_bias,  # Updated to political_bias
-                "fact_checks": analysis_result.fact_checks,
+                "fact_check_result": fact_check_result,
                 "emotional_triggers": analysis_result.emotional_triggers,
                 "stereotypes": analysis_result.stereotypes,
                 "manipulation_score": analysis_result.manipulation_score,
@@ -506,7 +508,7 @@ def shutdown_event():
     global is_running
     is_running = False
     spark_processor.stop()
-    #fact_checker.stop()
+    fact_checker.close_neo4j()  
     logger.info("Application shutdown complete")
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+#backend/fact_checker.py
 import os
 import logging
 import requests
@@ -1049,14 +1049,7 @@ if __name__ == "__main__":
     # Run 1: Will likely process most claims fully
     # Run 2: Should find several claims in the KG if Run 1 was successful
     input_text = (
-        "The Earth is flat according to the Flat Earth Society. The moon is made of green cheese, isn't it? " # Non-checkable Q
-        "COVID-19 vaccines, developed by Pfizer and Moderna, are generally safe and effective according to major health organizations like the WHO in 2023. " # Checkable
-        "Mars is primarily inhabited by autonomous robots like Curiosity sent from Earth last year. " # Checkable
-        "Climate change is not happening. I think the weather is beautiful today. " # Checkable, Non-checkable (Opinion)
-        "Paris is the capital of France since 508 AD. This sentence is just filler and probably not factual. " # Checkable, Non-checkable (Self-ref)
-        "You must agree with me. London is great." # Non-checkable (Imperative), Non-Checkable (Subjective Adj)
-        "The Eiffel Tower is located in Berlin." # New checkable claim for Run 2 example
-    )
+        "COVID-19 vaccines are ineffective"    )
     print(f"\nInput Text:\n{input_text}\n")
 
 
@@ -1119,7 +1112,7 @@ if __name__ == "__main__":
 
             if source == "Full Pipeline":
                 ner_ents = res.get('ner_entities', [])
-                if ner_ents: print(f"  - NER Entities: {', '.join([f'{e['text']}({e['label']})' for e in ner_ents])}")
+                if ner_ents: print("  - NER Entities: {}".format(', '.join(["{}({})".format(e['text'], e['label']) for e in ner_ents])))
                 else: print("  - NER Entities: None Found")
                 print(f"  - Factual Score (0-1): {res.get('factual_score'):.2f}" if res.get('factual_score') is not None else "N/A")
                 print(f"  - Initial Check Result: '{res.get('initial_verdict_raw','?')}'")
