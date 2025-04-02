@@ -38,7 +38,8 @@ from sentence_transformers import SentenceTransformer
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
-from neo4j import GraphDatabase, basic_auth # Import Neo4j explicitly with auth
+# Import Neo4j explicitly with auth and exceptions
+from neo4j import GraphDatabase, basic_auth, exceptions as neo4j_exceptions
 
 # --- Configuration ---
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'; os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -56,8 +57,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # --- Neo4j Configuration ---
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "priyanshi") 
-NEO4J_DATABASE = "veristream" 
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "priyanshi") # Ensure this is correct
+NEO4J_DATABASE = "veristream"
+KG_CONFIDENCE_THRESHOLD = 0.85 # Minimum confidence required to trust KG verdict
 
 # Clients
 groq_client = None
@@ -157,8 +159,10 @@ Your JSON Response:
         llm_output_text = response.choices[0].message.content; logging.debug(f"Groq LLM Raw: {llm_output_text}")
         # Parse JSON
         try:
+            # Handle potential markdown code blocks
             if llm_output_text.strip().startswith("```json"): llm_output_text=llm_output_text.strip()[7:-3].strip()
             elif llm_output_text.strip().startswith("```"): llm_output_text=llm_output_text.strip()[3:-3].strip()
+
             llm_res = json.loads(llm_output_text); v=llm_res.get("verdict"); j=llm_res.get("justification")
             if isinstance(v,str) and v in ["True","False"] and isinstance(j,str) and j:
                 conf = 0.90 if v=="True" else (0.88 if rag_evidence else 0.85) # Slightly lower confidence if False based on no evidence
@@ -240,7 +244,7 @@ class FactChecker:
         if NLP is None: logging.warning("spaCy model not loaded. Claim filtering/preprocessing basic.")
         self.nlp_available = NLP is not None
         self.claim_queue=queue.Queue(); self.results={}; self.results_lock=Lock(); self.shap_explanations=[]
-        self.raw_fact_checks={}; self.raw_searches={}; self.claim_ner={}
+        self.raw_fact_checks={}; self.raw_searches={} # Removed self.claim_ner (handled within claim data dict)
 
         # Neo4j Driver Initialization
         self.neo4j_driver = None
@@ -249,11 +253,74 @@ class FactChecker:
             self.neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=basic_auth(NEO4J_USER, NEO4J_PASSWORD))
             # Verify connection and database existence
             with self.neo4j_driver.session(database=NEO4J_DATABASE) as session:
-                session.run("MATCH (n) RETURN count(n) LIMIT 1") # Simple query to test connection
+                session.run("RETURN 1") # Simple query to test connection
             logging.info(f"Neo4j driver initialized for database '{NEO4J_DATABASE}'.")
+        except neo4j_exceptions.AuthError as auth_err:
+             logging.error(f"Neo4j Authentication Failed for user '{NEO4J_USER}'. Check credentials. Error: {auth_err}")
+             self.neo4j_driver = None
+        except neo4j_exceptions.ServiceUnavailable as conn_err:
+             logging.error(f"Neo4j Service Unavailable at URI '{NEO4J_URI}'. Check if Neo4j is running. Error: {conn_err}")
+             self.neo4j_driver = None
         except Exception as e:
-            logging.error(f"Failed to initialize Neo4j driver for URI '{NEO4J_URI}', DB '{NEO4J_DATABASE}': {e}")
+            logging.error(f"Failed to initialize Neo4j driver for URI '{NEO4J_URI}', DB '{NEO4J_DATABASE}': {e}", exc_info=True)
             self.neo4j_driver = None # Ensure driver is None if init fails
+
+
+    # --- ADDED: Function to check Knowledge Graph first ---
+    def check_kg_for_claim(self, preprocessed_claim: str) -> dict | None:
+        """Queries Neo4j for a matching preprocessed claim with a reliable verdict."""
+        if not self.neo4j_driver:
+            logging.warning("KG Check skipped: Neo4j driver not available.")
+            return None
+        if not preprocessed_claim:
+             logging.warning("KG Check skipped: Empty preprocessed claim provided.")
+             return None
+
+        logging.debug(f"KG Check: Querying for preprocessed claim: '{preprocessed_claim}'")
+        query = """
+        MATCH (c:Claim {preprocessed_text: $prep_text})-[:HAS_VERDICT]->(v:Verdict)
+        WHERE v.verdict_label IN ["True", "False"] AND v.confidence >= $min_confidence
+        RETURN c.text AS original_claim,
+               v.verdict_label AS verdict_label,
+               v.confidence AS confidence,
+               v.explanation AS explanation,
+               c.timestamp AS timestamp // Get timestamp for potential freshness check later
+        ORDER BY v.confidence DESC, c.timestamp DESC // Prioritize higher confidence, then newer
+        LIMIT 1
+        """
+        params = {"prep_text": preprocessed_claim, "min_confidence": KG_CONFIDENCE_THRESHOLD}
+
+        try:
+            with self.neo4j_driver.session(database=NEO4J_DATABASE) as session:
+                result = session.run(query, params).single()
+
+            if result:
+                logging.info(f"KG HIT: Found existing verdict for '{preprocessed_claim}' -> '{result['verdict_label']}' (Conf: {result['confidence']:.2f})")
+                # Format the result similarly to the final pipeline output
+                kg_result_dict = {
+                    "original_claim": result["original_claim"],
+                    "preprocessed_claim": preprocessed_claim, # Include for consistency
+                    "ner_entities": [], # Not fetched in this simple query, could be added
+                    "factual_score": None, # Not fetched
+                    "initial_verdict_raw": "From KG",
+                    "initial_evidence": "From KG",
+                    "rag_status": "N/A (From KG)",
+                    "top_rag_snippets": [], # Not applicable
+                    "final_verdict": f"{result['verdict_label']} (Confidence: {result['confidence']:.2f})",
+                    "final_explanation": result["explanation"],
+                    "source": "Knowledge Graph", # Add source field
+                    "kg_timestamp": result["timestamp"] # Store timestamp if needed
+                }
+                return kg_result_dict
+            else:
+                logging.info(f"KG MISS: No reliable verdict found for '{preprocessed_claim}'.")
+                return None
+        except neo4j_exceptions.ServiceUnavailable as e:
+            logging.error(f"KG Check Failed: Neo4j connection error: {e}")
+            return None # Treat connection errors as a miss
+        except Exception as e:
+            logging.error(f"KG Check Failed: Error querying Neo4j for '{preprocessed_claim}': {e}", exc_info=True)
+            return None # Treat other errors as a miss
 
 
     # --- UPDATED store_in_neo4j function ---
@@ -261,6 +328,10 @@ class FactChecker:
         if not self.neo4j_driver:
            logging.error("Neo4j driver not initialized. Cannot store data.")
            return
+        # Avoid storing if the source was already the KG
+        if claim_data.get("source") == "Knowledge Graph":
+             logging.debug(f"Skipping Neo4j store for claim already retrieved from KG: '{claim_data['original_claim']}'")
+             return
 
         claim = claim_data['original_claim']
         preprocessed_claim = claim_data['preprocessed_claim']
@@ -274,11 +345,17 @@ class FactChecker:
                 final_label = parts[0].strip() # e.g., "True" or "False"
                 confidence_str = parts[1][:-1] # Remove closing parenthesis
                 confidence = float(confidence_str)
-            else:
-                 final_label = final_verdict_str # Use the whole string if format is unexpected
-                 logging.warning(f"Could not parse confidence from final verdict string: '{final_verdict_str}'")
+            elif final_verdict_str in ["True", "False"]: # Handle simple True/False if confidence parsing failed but label is valid
+                 final_label = final_verdict_str
+                 confidence = 0.5 # Assign default confidence? Or keep 0?
+                 logging.warning(f"Could not parse confidence from final verdict string: '{final_verdict_str}'. Using label '{final_label}' and default confidence.")
+            else: # Handle error cases like "LLM Error", "Processing Error"
+                 final_label = final_verdict_str # Store the error string as the label
+                 confidence = 0.1 # Low confidence for errors
+                 logging.warning(f"Storing non-standard verdict label: '{final_verdict_str}'")
         except Exception as e:
             final_label = final_verdict_str # In case parsing fails, keep the original string
+            confidence = 0.1
             logging.warning(f"Could not parse confidence from final verdict string '{final_verdict_str}': {e}")
 
 
@@ -286,7 +363,9 @@ class FactChecker:
         initial_evidence = claim_data.get('initial_evidence', "")
         rag_status = claim_data.get('rag_status', "")
         initial_verdict_raw = claim_data.get('initial_verdict_raw', "")
+        # Use get with default for factual_score
         factual_score = claim_data.get('factual_score', 0.0)
+        if factual_score is None: factual_score = 0.0 # Ensure it's not None
 
         top_rag_snippets = claim_data.get('top_rag_snippets', []) # List of formatted snippet strings
         timestamp = time.time()
@@ -297,18 +376,26 @@ class FactChecker:
             try:
                 tx = session.begin_transaction()
 
-                # 1. Create Claim node
-                # Returns the node object itself and its internal ID
+                # 1. MERGE Claim node based on preprocessed_text to avoid duplicates
+                # If claim exists, update timestamp and other potentially changed props.
+                # If not exists, create it.
                 claim_node_result = tx.run("""
-                    CREATE (c:Claim {
-                        text: $text,
-                        preprocessed_text: $preprocessed_text,
-                        timestamp: $timestamp,
-                        initial_verdict_raw: $initial_verdict_raw,
-                        rag_status: $rag_status,
-                        initial_evidence: $initial_evidence,
-                        factual_score: $factual_score
-                    })
+                    MERGE (c:Claim {preprocessed_text: $preprocessed_text})
+                    ON CREATE SET
+                        c.text = $text,
+                        c.timestamp = $timestamp,
+                        c.initial_verdict_raw = $initial_verdict_raw,
+                        c.rag_status = $rag_status,
+                        c.initial_evidence = $initial_evidence,
+                        c.factual_score = $factual_score
+                    ON MATCH SET
+                        c.timestamp = $timestamp, // Update timestamp on match
+                        c.initial_verdict_raw = $initial_verdict_raw,
+                        c.rag_status = $rag_status,
+                        c.initial_evidence = $initial_evidence,
+                        c.factual_score = $factual_score,
+                        // Optionally update original text if it differs significantly?
+                        c.text = CASE WHEN c.text <> $text THEN $text ELSE c.text END
                     RETURN c, id(c) as claim_id
                 """,
                                  text=claim, preprocessed_text=preprocessed_claim, timestamp=timestamp,
@@ -316,13 +403,24 @@ class FactChecker:
                                  initial_evidence=initial_evidence, factual_score=factual_score).single()
 
                 if not claim_node_result:
-                    raise Exception("Claim node creation failed.")
+                    raise Exception(f"Claim node MERGE failed for preprocessed text: {preprocessed_claim}")
 
                 claim_node = claim_node_result['c']      # The actual node object
                 claim_node_id = claim_node_result['claim_id'] # The internal Neo4j ID
 
-                # 2. Create Verdict node
-                # Returns only the internal ID
+                # --- Verdict Handling: Remove old verdicts, create new one ---
+                # It's often cleaner to remove old related nodes like verdicts/evidence
+                # and create new ones rather than trying to update them in place,
+                # especially if the verdict could change significantly.
+
+                # Delete existing HAS_VERDICT relationship and Verdict node for this claim
+                tx.run("""
+                    MATCH (c:Claim)-[r:HAS_VERDICT]->(old_v:Verdict)
+                    WHERE id(c) = $claim_node_id
+                    DELETE r, old_v
+                """, claim_node_id=claim_node_id)
+
+                # 2. Create the NEW Verdict node
                 verdict_node_result = tx.run("""
                     CREATE (v:Verdict {
                         verdict_label: $verdict_label,
@@ -337,7 +435,7 @@ class FactChecker:
 
                 verdict_id = verdict_node_result['verdict_id']
 
-                # 3. Link Claim to Verdict using the claim node object and verdict ID
+                # 3. Link Claim to the NEW Verdict
                 tx.run("""
                     MATCH (c), (v)
                     WHERE id(c) = $claim_node_id AND id(v) = $verdict_id
@@ -345,7 +443,15 @@ class FactChecker:
                     """, claim_node_id=claim_node_id, verdict_id=verdict_id)
 
 
-                # 4. Create and link EvidenceSnippet nodes
+                # --- Evidence Snippet Handling: Remove old, create new ---
+                # Delete existing HAS_EVIDENCE relationships and EvidenceSnippet nodes for this claim
+                tx.run("""
+                       MATCH (c:Claim)-[r:HAS_EVIDENCE]->(old_es:EvidenceSnippet)
+                       WHERE id(c) = $claim_node_id
+                       DELETE r, old_es
+                       """, claim_node_id=claim_node_id)
+
+                # 4. Create and link NEW EvidenceSnippet nodes
                 for i, snippet_formatted_string in enumerate(top_rag_snippets):
                     source = "?" # Default source
                     content = snippet_formatted_string # Default content if parsing fails
@@ -355,19 +461,17 @@ class FactChecker:
                              parts = snippet_formatted_string.split('\" (')
                              content_part = parts[0]
                              source = parts[1][:-1] if len(parts)>1 else "?" # Extract source, remove last ')'
-                             # Extract content after "Snip X: " and remove quotes
                              if ': "' in content_part:
                                  content = content_part.split(': "', 1)[1]
-                             else: # Fallback if format slightly different
-                                 content = content_part
+                             else: content = content_part
                         else:
                              logging.warning(f"Could not parse snippet format: '{snippet_formatted_string}'")
-                             content = snippet_formatted_string # Keep original if parse fails
+                             content = snippet_formatted_string
                     except Exception as e:
                         logging.warning(f"Snippet parsing failed for: '{snippet_formatted_string}' - {e}")
-                        content = snippet_formatted_string # Keep original on error
+                        content = snippet_formatted_string
 
-                    # Create EvidenceSnippet node
+                    # Create NEW EvidenceSnippet node
                     evidence_snippet_node_result = tx.run("""
                         CREATE (es:EvidenceSnippet {
                             content: $content,
@@ -379,7 +483,7 @@ class FactChecker:
 
                     if evidence_snippet_node_result:
                         evidence_snippet_id = evidence_snippet_node_result['snippet_id']
-                        # Link Claim to EvidenceSnippet using claim node object and snippet ID
+                        # Link Claim to the NEW EvidenceSnippet
                         tx.run("""
                             MATCH (c), (es)
                             WHERE id(c) = $claim_node_id AND id(es) = $evidence_snippet_id
@@ -389,7 +493,8 @@ class FactChecker:
                          logging.warning(f"Failed to create EvidenceSnippet node for snippet index {i}")
 
 
-                # 5. Create and link Entity nodes
+                # --- Entity Handling: MERGE entities and MERGE relationships ---
+                # We MERGE entities to reuse them, and MERGE relationships to avoid duplicates.
                 for entity in entities:
                     entity_text = entity.get('text')
                     entity_label = entity.get('label')
@@ -405,18 +510,18 @@ class FactChecker:
 
                     if entity_node_result:
                         entity_id = entity_node_result['entity_id']
-                        # Link Claim to Entity using claim node object and entity ID
+                        # MERGE the relationship between Claim and Entity
                         tx.run("""
                             MATCH (c), (e)
                             WHERE id(c) = $claim_node_id AND id(e) = $entity_id
                             MERGE (c)-[:MENTIONS]->(e)
-                            """, claim_node_id=claim_node_id, entity_id=entity_id) # Use MERGE for idempotency
+                            """, claim_node_id=claim_node_id, entity_id=entity_id)
                     else:
                         logging.warning(f"Failed to merge Entity node for: {entity_text} ({entity_label})")
 
 
                 tx.commit()
-                logging.info(f"Stored claim '{claim}' in Neo4j (DB: {NEO4J_DATABASE}) with new granular schema.")
+                logging.info(f"Stored/Updated claim '{claim}' in Neo4j (DB: {NEO4J_DATABASE}).")
 
             except Exception as e:
                 if tx:
@@ -425,10 +530,7 @@ class FactChecker:
                         tx.rollback()
                     except Exception as rb_e:
                          logging.error(f"Error during rollback: {rb_e}")
-                # Log the specific error leading to the rollback
-                logging.error(f"Error storing claim '{claim}' in Neo4j (DB: {NEO4J_DATABASE}) with new schema: {e}", exc_info=True)
-            # finally: # Session is closed automatically by 'with' statement
-            #     pass
+                logging.error(f"Error storing/updating claim '{claim}' in Neo4j (DB: {NEO4J_DATABASE}): {e}", exc_info=True)
 
     # --- End UPDATED store_in_neo4j function ---
 
@@ -456,28 +558,30 @@ class FactChecker:
             orig=[cd["original_claim"] for cd in checkable_claims_data]; embeds=self.embedding_model.encode(orig,convert_to_tensor=True,show_progress_bar=False)
             for i,cd in enumerate(checkable_claims_data):
                 e=embeds[i].cpu().numpy(); s=0.5+(np.linalg.norm(e)/(np.linalg.norm(e)*25+1e-6)) if np.linalg.norm(e)>0 else 0.5; s=min(max(s,0.0),1.0); p=s
-                cd["score"]=s; cd["priority"]=p; logging.info(f"Prioritize: '{cd['original_claim']}' -> Prio:{p:.2f}")
+                # Add factual score directly to the dict here
+                cd["factual_score"]=s;
+                cd["priority"]=p; logging.info(f"Prioritize: '{cd['original_claim']}' -> Score:{s:.2f}, Prio:{p:.2f}")
             checkable_claims_data.sort(key=lambda x:x['priority'],reverse=True); logging.info(f"Prioritized {len(checkable_claims_data)} claims."); return checkable_claims_data
         except Exception as e: logging.error(f"Prioritization error: {e}",exc_info=True); return []
 
     def add_claims_to_queue(self, claims_to_process: list):
         if not claims_to_process: logging.warning("Queue: No claims."); return
         for cd_dict in claims_to_process: self.claim_queue.put(cd_dict)
-        logging.info(f"Queued {len(claims_to_process)} claims. Size: {self.claim_queue.qsize()}")
+        logging.info(f"Queued {len(claims_to_process)} claims for full processing. Queue Size: {self.claim_queue.qsize()}")
 
     def process_claim(self, claim_data_dict: dict):
-        """Pipeline: GFactCheck(prep) -> GCustomSearch(prep) -> RAG(orig) -> LLM Verdict(orig, RAG) -> Neo4j Store."""
+        """Pipeline for claims *not* found in KG: GFactCheck -> GSearch -> RAG -> LLM -> Neo4j Store."""
         original_claim = claim_data_dict['original_claim']; preprocessed_claim = claim_data_dict['preprocessed_claim']
         ner_entities = claim_data_dict['ner_entities']; start_time = time.time()
-        logging.info(f"Processing: \"{original_claim}\" (API Query: \"{preprocessed_claim}\")")
+        logging.info(f"Full Process: \"{original_claim}\" (API Query: \"{preprocessed_claim}\")")
 
         result = { # Initialize full result dict
             "original_claim": original_claim, "preprocessed_claim": preprocessed_claim, "ner_entities": ner_entities,
-            "factual_score": claim_data_dict.get('score', None),
+            "factual_score": claim_data_dict.get('factual_score', 0.0), # Get score from prioritization step
             "initial_verdict_raw": "N/A", "initial_evidence": "N/A", # Step 1 result
             "rag_status": "Not Attempted", "top_rag_snippets": [], # Step 2/3 results
             "final_verdict": "Pending", "final_explanation": "N/A", # Step 4 results (LLM)
-            # top_rag_snippets initialized above
+            "source": "Full Pipeline" # Mark source
         }
         rag_evidence_for_llm = [] # Data for LLM
 
@@ -549,172 +653,354 @@ class FactChecker:
 
 
         processing_time = time.time() - start_time
-        logging.info(f"Final Verdict for '{original_claim}': {result['final_verdict']}. (RAG-LLM Explain: {result['final_explanation']}). (Time:{processing_time:.2f}s)")
+        logging.info(f"Verdict (Full Pipeline) for '{original_claim}': {result['final_verdict']}. (Explain: {result['final_explanation']}). (Time:{processing_time:.2f}s)")
         with self.results_lock: self.results[original_claim] = result # Store final result keyed by original claim
 
     def worker(self):
         t_obj=current_thread(); t_name=t_obj.name; logging.info(f"W {t_name} start.")
         while True:
             cd_dict=None
-            try: cd_dict=self.claim_queue.get(timeout=1); self.process_claim(cd_dict); self.claim_queue.task_done()
-            except queue.Empty: logging.info(f"W {t_name} empty."); break
+            try:
+                cd_dict=self.claim_queue.get(timeout=1)
+                self.process_claim(cd_dict) # This is the full pipeline process
+                self.claim_queue.task_done()
+            except queue.Empty:
+                logging.info(f"W {t_name} queue empty."); break
             except Exception as e:
-                orig_claim=cd_dict.get('original_claim','?') if cd_dict else '?'; logging.error(f"W {t_name} err processing claim '{orig_claim}': {e}",exc_info=True)
+                orig_claim=cd_dict.get('original_claim','?') if cd_dict else '?'; logging.error(f"W {t_name} error processing claim '{orig_claim}': {e}",exc_info=True)
                 if cd_dict:
-                    with self.results_lock: self.results[orig_claim]={"original_claim":orig_claim,"final_verdict":"Processing Error","final_explanation":f"Worker error: {e}"} # Store error
+                    # Store error state in results
+                    with self.results_lock:
+                        self.results[orig_claim]={
+                            "original_claim":orig_claim,
+                            "preprocessed_claim": cd_dict.get('preprocessed_claim','?'),
+                            "final_verdict":"Processing Error",
+                            "final_explanation":f"Worker error: {e}",
+                            "source": "Error" # Mark source as Error
+                            }
                     try:
                         self.claim_queue.task_done() # Mark task done even on error
                     except ValueError: pass # If already marked done elsewhere?
         logging.info(f"W {t_name} finish.")
 
-    def train_and_run_shap(self, checkable_claims_data: list):
-        if not self.shap_available: logging.warning("SHAP unavailable."); self.shap_explanations = [{"claim":cd.get('original_claim', '?'),"shap_values":"[SHAP Unavailable]"} for cd in checkable_claims_data]; return
-        logging.info("Attempting SHAP explanations...");
-        valid_claims_data = [cd for cd in checkable_claims_data if cd.get("original_claim")]
+    def train_and_run_shap(self, claims_processed_fully: list):
+        """Runs SHAP analysis only on claims that went through the full pipeline."""
+        if not self.shap_available: logging.warning("SHAP unavailable."); self.shap_explanations = [{"claim":cd.get('original_claim', '?'),"shap_values":"[SHAP Unavailable]"} for cd in claims_processed_fully]; return
+        if not claims_processed_fully: logging.info("SHAP: No claims went through the full pipeline, skipping SHAP."); self.shap_explanations = []; return
+
+        logging.info(f"Attempting SHAP explanations for {len(claims_processed_fully)} fully processed claims...");
+        valid_claims_data = [cd for cd in claims_processed_fully if cd.get("original_claim")]
         if not valid_claims_data: logging.warning("No valid claims data for SHAP."); self.shap_explanations=[]; return
+
         sentences = [cd['original_claim'] for cd in valid_claims_data]
         if not sentences: logging.warning("No sentences extracted for SHAP."); self.shap_explanations=[]; return
-        embed_dim_fallback=384;
+
+        # Initialize explanations structure
+        self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":"[SHAP Pending]"} for cd in valid_claims_data]
+
         try:
-            embed_dim_fallback=self.embedding_model.get_sentence_embedding_dimension()
-        except:
-            logging.warning("No emb dim.")
-        self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":"[SHAP Pending]" if embed_dim_fallback>0 else "[SHAP Err Dim]"} for cd in valid_claims_data]
+            embed_dim=self.embedding_model.get_sentence_embedding_dimension()
+        except Exception:
+            logging.warning("Could not get embedding dimension for SHAP fallback.")
+            embed_dim = 384 # Fallback dimension
+
         try:
-            embeddings=self.embedding_model.encode(sentences,convert_to_tensor=False,show_progress_bar=False); logging.debug(f"SHAP embeds: {embeddings.shape if isinstance(embeddings,np.ndarray) else 'Invalid'}")
+            embeddings=self.embedding_model.encode(sentences,convert_to_tensor=False,show_progress_bar=False); logging.debug(f"SHAP embeds: {embeddings.shape if isinstance(embeddings,np.ndarray) else 'Invalid Type'}")
+
             def predict_scores(np_embeds):
-                 if not isinstance(np_embeds,np.ndarray):
-                     try: np_embeds=np.array(np_embeds); assert np_embeds.ndim==2
-                     except: logging.error("SHAP pred input err"); return np.full(len(np_embeds) if hasattr(np_embeds,'__len__') else 1, 0.5)
+                 # Input validation for prediction function
+                 if not isinstance(np_embeds, np.ndarray):
+                     try:
+                         np_embeds = np.array(np_embeds)
+                         if np_embeds.ndim == 1: # Handle single instance prediction
+                             np_embeds = np_embeds.reshape(1, -1)
+                         assert np_embeds.ndim == 2
+                     except Exception as pred_e:
+                          logging.error(f"SHAP predict input error: {pred_e}. Input type: {type(np_embeds)}")
+                          # Return default score for expected number of inputs
+                          num_inputs = len(np_embeds) if hasattr(np_embeds, '__len__') else 1
+                          return np.full(num_inputs, 0.5)
+
                  scs=[];
-                 for e in np_embeds: r=float(np.linalg.norm(e)); s=0.5+(r/(r*25+1e-6)) if r>0 else 0.5; scs.append(min(max(s,0.0),1.0))
+                 for e in np_embeds:
+                     # Ensure e is treated as a 1D array for norm calculation
+                     e_1d = e.flatten()
+                     r=float(np.linalg.norm(e_1d));
+                     s=0.5+(r/(r*25+1e-6)) if r>0 else 0.5;
+                     scs.append(min(max(s,0.0),1.0))
                  return np.array(scs)
-            if not isinstance(embeddings,np.ndarray) or embeddings.ndim!=2 or embeddings.shape[0]<1: # Allow single instance
-                logging.error(f"Invalid embeds for SHAP: shape={embeddings.shape if isinstance(embeddings, np.ndarray) else type(embeddings)}. Need 2D numpy array.");
+
+            # Validate embeddings shape for SHAP
+            if not isinstance(embeddings, np.ndarray) or embeddings.ndim != 2 or embeddings.shape[0] < 1:
+                logging.error(f"Invalid embeddings for SHAP: shape={embeddings.shape if isinstance(embeddings, np.ndarray) else type(embeddings)}. Need 2D numpy array.");
                 self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":"[SHAP Embed Err]"} for cd in valid_claims_data]; return
-            embed_dim=embeddings.shape[1]; logging.debug("Creating SHAP bg..."); bg_obj=None
+
+            logging.debug("Creating SHAP background data..."); bg_data=None
             try:
-                 # Handle case with fewer samples than clusters (use embeddings directly)
-                 n_c=min(10,embeddings.shape[0]);
-                 bg_obj=shap.kmeans(embeddings,n_c) if embeddings.shape[0] >= n_c and n_c > 1 else embeddings
-                 bg_data=None
-                 if hasattr(bg_obj,'data') and isinstance(getattr(bg_obj,'data',None),np.ndarray): bg_data=bg_obj.data; logging.debug("Got .data from SHAP bg.")
-                 elif isinstance(bg_obj,np.ndarray): bg_data=bg_obj; logging.debug("Using np array for SHAP bg.")
-                 else: logging.error(f"Bad SHAP bg type: {type(bg_obj).__name__}."); self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Bg Type Err]"} for cd in valid_claims_data]; return
-                 logging.debug(f"SHAP Bg shape: {bg_data.shape}")
-            except Exception as ke: logging.warning(f"KMeans fail: {ke}. Using raw."); bg_data=embeddings
-            if bg_data is None or not isinstance(bg_data,np.ndarray): logging.error("SHAP bg prep fail."); return
-            logging.debug("Init SHAP KernelExplainer..."); explainer=shap.KernelExplainer(predict_scores,bg_data)
-            logging.info(f"Calculating SHAP vals ({embeddings.shape[0]} inst)..."); shap_vals=explainer.shap_values(embeddings,nsamples=50)
-            logging.info("SHAP vals calculated.")
+                 n_bg_samples = min(100, embeddings.shape[0]) # Limit background samples
+                 n_clusters = min(10, n_bg_samples) # Clusters should be <= samples
+                 if embeddings.shape[0] >= n_clusters and n_clusters > 1:
+                     bg_obj = shap.kmeans(embeddings, n_clusters)
+                     if hasattr(bg_obj, 'data') and isinstance(bg_obj.data, np.ndarray):
+                         bg_data = bg_obj.data
+                         logging.debug(f"Using KMeans background data, shape: {bg_data.shape}")
+                     else:
+                          logging.warning("KMeans object missing '.data', using raw embeddings for background.")
+                          bg_data = embeddings[:n_bg_samples] # Use subset
+                 else: # Not enough samples for kmeans or only 1 sample
+                     logging.debug(f"Using raw embeddings for background (samples: {embeddings.shape[0]})")
+                     bg_data = embeddings
+            except Exception as ke:
+                 logging.warning(f"SHAP KMeans failed: {ke}. Using raw embeddings for background.")
+                 bg_data = embeddings[:min(100, embeddings.shape[0])] # Use subset on error too
+
+            if bg_data is None or not isinstance(bg_data, np.ndarray):
+                logging.error("SHAP background data preparation failed."); return
+
+            # Ensure background data is 2D
+            if bg_data.ndim == 1: bg_data = bg_data.reshape(1,-1)
+
+            logging.debug("Initializing SHAP KernelExplainer...");
+            explainer=shap.KernelExplainer(predict_scores, bg_data)
+
+            logging.info(f"Calculating SHAP values for {embeddings.shape[0]} instance(s)...");
+             # Use appropriate nsamples, potentially fewer for many instances
+            n_samples_shap = min(50, 2 * bg_data.shape[1] + 2048) # SHAP default logic approximation
+            shap_vals=explainer.shap_values(embeddings, nsamples=n_samples_shap)
+            logging.info("SHAP values calculated.")
+
             calc_expl=[]
-            # Handle scalar SHAP value output for single instance
-            if isinstance(shap_vals, np.ndarray) and shap_vals.ndim == 1 and len(sentences) == 1:
-                 calc_expl.append({"claim":sentences[0],"shap_values":shap_vals.tolist()})
-                 logging.info(f"SHAP stored for 1 claim.")
-                 self.shap_explanations = calc_expl
-            elif isinstance(shap_vals, np.ndarray) and shap_vals.ndim == 2 and shap_vals.shape[0] == len(sentences):
-                for i,ct in enumerate(sentences): calc_expl.append({"claim":ct,"shap_values":shap_vals[i].tolist()}) # Use original claim
-                logging.info(f"SHAP stored for {len(calc_expl)} claims.")
-                self.shap_explanations=calc_expl # Success
-            else: logging.error(f"SHAP vals mismatch/None. Got shape {shap_vals.shape if isinstance(shap_vals,np.ndarray) else type(shap_vals)}, expected ({len(sentences)}, {embed_dim}) or ({embed_dim},) for single."); self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Calc Err Shape]"} for cd in valid_claims_data]
-        except Exception as e: logging.error(f"SHAP gen error: {e}",exc_info=True); final_dim=embed_dim if 'embed_dim' in locals() else embed_dim_fallback; self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Error: {type(e).__name__}]" if final_dim==0 else [0.0]*final_dim} for cd in valid_claims_data]
+            # Handle different SHAP output shapes (scalar, 1D array, 2D array)
+            if isinstance(shap_vals, (float, np.number)) and len(sentences) == 1: # Single scalar output
+                 # Need to create a list matching embedding dim for consistency? Or store scalar?
+                 # Storing a list of zeros might be misleading. Store specific message.
+                 calc_expl.append({"claim":sentences[0],"shap_values":f"[SHAP Scalar Output: {shap_vals}]"})
+                 logging.warning("SHAP returned a scalar value, expected array.")
 
-    def generate_chain_of_thought(self, checkable_claims_data: list, non_checkable_claims: list) -> str:
+            elif isinstance(shap_vals, np.ndarray):
+                if shap_vals.ndim == 1 and len(sentences) == 1 and shap_vals.shape[0] == embed_dim: # Single instance, correct shape
+                     calc_expl.append({"claim":sentences[0],"shap_values":shap_vals.tolist()})
+                elif shap_vals.ndim == 2 and shap_vals.shape[0] == len(sentences) and shap_vals.shape[1] == embed_dim: # Multiple instances
+                    for i, ct in enumerate(sentences): calc_expl.append({"claim":ct,"shap_values":shap_vals[i].tolist()})
+                else: # Mismatched shape
+                     logging.error(f"SHAP values shape mismatch. Got {shap_vals.shape}, expected ({len(sentences)}, {embed_dim}) or ({embed_dim},) for single instance.");
+                     calc_expl = [{"claim":cd['original_claim'],"shap_values":f"[SHAP Calc Err Shape: {shap_vals.shape}]"} for cd in valid_claims_data]
+            else: # Unexpected output type
+                 logging.error(f"SHAP values unexpected type: {type(shap_vals)}.");
+                 calc_expl = [{"claim":cd['original_claim'],"shap_values":f"[SHAP Calc Err Type: {type(shap_vals).__name__}]"} for cd in valid_claims_data]
+
+            if calc_expl: logging.info(f"SHAP results stored for {len(calc_expl)} claims.")
+            self.shap_explanations = calc_expl # Update with calculated explanations
+
+        except Exception as e:
+            logging.error(f"SHAP generation error: {e}",exc_info=True);
+            # Provide fallback explanation based on error
+            self.shap_explanations=[{"claim":cd['original_claim'],"shap_values":f"[SHAP Error: {type(e).__name__}]"} for cd in valid_claims_data]
+
+
+    def generate_chain_of_thought(self, all_processed_claims: list, non_checkable_claims: list) -> str:
+        """Generates CoT including KG hits and fully processed claims."""
         cot = ["Chain of Thought Summary:"]
-        cot.append("1. Preprocessed: Segmented, Filtered, NER, Simplified checkable claims for API.")
+        # 1. Preprocessing Summary
+        cot.append("1. Input Segmentation & Filtering:")
+        total_initial = len(all_processed_claims) + len(non_checkable_claims)
+        cot.append(f"   - Initial Sentences: {total_initial}")
         if non_checkable_claims: cot.append(f"   - Filtered Non-Checkable ({len(non_checkable_claims)}): {non_checkable_claims}")
-        claims_str=[f"'{c['original_claim']}' (Prio:{c.get('priority',0):.2f})" for c in checkable_claims_data]
-        if claims_str: cot.append(f"   - Prioritized Checkable ({len(claims_str)}): [{', '.join(claims_str)}]")
-        else: cot.append("   - No checkable claims identified."); return "\n".join(cot)
-        cot.append("2. Processed Checkable Claims:")
-        with self.results_lock:
-            for i,cd_proc in enumerate(checkable_claims_data):
-                claim=cd_proc['original_claim']; res=self.results.get(claim)
-                if res:
-                    cot.append(f"   - Claim {i+1}: '{claim}'")
-                    cot.append(f"     - Initial Check (using '{res.get('preprocessed_claim','?')}'): Verdict='{res.get('initial_verdict_raw','?')}'")
-                    cot.append(f"     - RAG Status (using '{res.get('preprocessed_claim','?')}'): {res.get('rag_status','?')}")
-                    cot.append(f"     - LLM Final Verdict (based on RAG for original claim '{claim}'): {res.get('final_verdict','?')}")
-                    cot.append(f"     - LLM Justification: {res.get('final_explanation','?')}")
-                    # Indicate Neo4j storage attempt
-                    if self.neo4j_driver:
-                        # Simple indicator, actual success/failure logged elsewhere
-                        cot.append(f"     - Neo4j Storage: Attempted (Check logs for status)")
-                    else:
-                        cot.append(f"     - Neo4j Storage: Skipped (Driver not initialized)")
+        cot.append(f"   - Checkable Claims Identified: {len(all_processed_claims)}")
 
-                else: cot.append(f"   - Claim {i+1}: '{claim}' -> Result Missing!")
-        cot.append("3. Generated SHAP for checkable claims' classification scores (if available/successful).")
-        # (SHAP summary logic same)
+        # 2. Preprocessing & Prioritization for Checkable Claims
+        checkable_claims_str = [f"'{c.get('original_claim','?')}' (Prio:{c.get('priority',0):.2f})" for c in all_processed_claims if c.get('source') != 'Knowledge Graph'] # Show priority only if calculated
+        if checkable_claims_str: cot.append(f"   - Preprocessed & Prioritized ({len(checkable_claims_str)}): [{', '.join(checkable_claims_str)}]")
+
+        # 3. KG Check & Pipeline Execution Summary
+        kg_hits = [c for c in all_processed_claims if c.get('source') == 'Knowledge Graph']
+        pipeline_processed = [c for c in all_processed_claims if c.get('source') == 'Full Pipeline']
+        errors = [c for c in all_processed_claims if c.get('source') == 'Error']
+
+        cot.append("2. Knowledge Graph Check & Processing:")
+        if kg_hits: cot.append(f"   - KG Hits ({len(kg_hits)}): Found existing reliable verdicts.")
+        else: cot.append("   - KG Hits: None found matching criteria.")
+        if pipeline_processed: cot.append(f"   - Full Pipeline ({len(pipeline_processed)}): Claims processed via APIs and LLM.")
+        else: cot.append("   - Full Pipeline: No claims required full processing.")
+        if errors: cot.append(f"   - Errors ({len(errors)}): Claims encountered processing errors.")
+
+        # 4. Detailed Results Summary (combining KG and Pipeline)
+        cot.append("3. Processed Claim Results:")
+        with self.results_lock: # Access self.results safely if needed, though all_processed_claims has the final data
+            for i, res in enumerate(all_processed_claims):
+                claim = res.get('original_claim','?')
+                source = res.get('source', '?')
+                cot.append(f"   - Claim {i+1}: '{claim}' (Source: {source})")
+                if source == "Knowledge Graph":
+                    cot.append(f"     - Final Verdict: {res.get('final_verdict','?')}")
+                    cot.append(f"     - Explanation: {res.get('final_explanation','?')}")
+                elif source == "Full Pipeline":
+                     cot.append(f"     - Initial Check: Verdict='{res.get('initial_verdict_raw','?')}'")
+                     cot.append(f"     - RAG Status: {res.get('rag_status','?')}")
+                     cot.append(f"     - LLM Final Verdict: {res.get('final_verdict','?')}")
+                     cot.append(f"     - LLM Justification: {res.get('final_explanation','?')}")
+                     if self.neo4j_driver: cot.append(f"     - Neo4j Storage: Stored/Updated")
+                elif source == "Error":
+                     cot.append(f"     - Final Verdict: {res.get('final_verdict','?')}")
+                     cot.append(f"     - Explanation: {res.get('final_explanation','?')}")
+                else: # Missing result? Should not happen with consolidation logic
+                     cot.append(f"     - Status: Result Missing or Unknown Source!")
+
+        # 5. SHAP Summary (based on pipeline_processed claims)
+        cot.append("4. SHAP Analysis (for fully processed claims):")
         if self.shap_explanations:
-             sh_sum=[]; has_real=False
-             for ex in self.shap_explanations:
-                 v=ex.get('shap_values',[]); s="[Err/Unavail]"
-                 if isinstance(v,list) and v:
-                     if all(isinstance(x,(int,float)) for x in v): s=f"[...{len(v)} SHAP vals...]" if not all(abs(y)<1e-9 for y in v) else "[SHAP Err Fallback]"; has_real=True if s.startswith("[...") else has_real
-                     else: s=str(v)
-                 elif isinstance(v,str): s=v
-                 elif not v: s="[No Data]"
-                 sh_sum.append(f"'{ex.get('claim','?')}': {s}") # Use original claim key
-             status = "Generated." if has_real else "Failed/Unavailable."
-             cot.append(f"   - SHAP Status: {status} Details: {{{', '.join(sh_sum)}}}")
-        else: cot.append("   - SHAP analysis skipped or no results.")
+             # Filter explanations for claims that were actually processed
+             processed_claims_originals = {c['original_claim'] for c in pipeline_processed}
+             relevant_explanations = [ex for ex in self.shap_explanations if ex.get('claim') in processed_claims_originals]
+
+             if relevant_explanations:
+                 sh_sum=[]; has_real=False
+                 for ex in relevant_explanations:
+                     v=ex.get('shap_values',[]); s="[Err/Unavail]"
+                     if isinstance(v,list) and v:
+                         if all(isinstance(x,(int,float)) for x in v): s=f"[...{len(v)} SHAP vals...]" if not any(isinstance(val, str) and val.startswith('[SHAP') for val in v) and not all(abs(y)<1e-9 for y in v) else "[SHAP Err/Fallback]"; has_real=True if s.startswith("[...") else has_real
+                         else: s=str(v) # Show content if not numbers (e.g., error string in list)
+                     elif isinstance(v,str): s=v # Error string like "[SHAP Embed Err]"
+                     elif not v: s="[No Data]"
+                     sh_sum.append(f"'{ex.get('claim','?')}': {s}")
+                 status = "Generated." if has_real else "Failed/Unavailable."
+                 cot.append(f"   - SHAP Status: {status} Details: {{{', '.join(sh_sum)}}}")
+             else:
+                 cot.append("   - SHAP analysis skipped (no relevant results for fully processed claims).")
+        else:
+            cot.append("   - SHAP analysis skipped or no results structure.")
+
         return "\n".join(cot)
 
+    # --- MODIFIED check method ---
     def check(self, text: str, num_workers: int = 2) -> dict:
         start=time.time(); logging.info(f"Starting check: \"{text[:100]}...\"")
-        with self.results_lock: self.results={}; self.shap_explanations=[]; self.raw_fact_checks={}; self.raw_searches={} # No claim_ner needed here
+        # Reset results and intermediate data
+        with self.results_lock:
+            self.results={}; self.shap_explanations=[]; self.raw_fact_checks={}; self.raw_searches={}
         while not self.claim_queue.empty():
             try: self.claim_queue.get_nowait(); self.claim_queue.task_done()
-            except: break
+            except queue.Empty: break
+            except Exception: pass # Ignore errors clearing queue
 
-        logging.info("Step 1: Preprocessing & Filtering..."); checkable_claims_data, non_checkable_sents=self.preprocess_and_filter(text) # Returns list of dicts
-        if not checkable_claims_data: logging.warning("No checkable claims found."); return {"processed_claims":[], "non_checkable_claims":non_checkable_sents, "summary":"No checkable claims.", "raw_fact_checks":{}, "raw_searches":{}}
+        logging.info("Step 1: Preprocessing & Filtering...");
+        checkable_claims_initial_data, non_checkable_sents=self.preprocess_and_filter(text)
 
-        logging.info("Step 2: Prioritizing..."); claims_to_process=self.classify_and_prioritize_claims(checkable_claims_data) # Returns list of dicts w/ priority
-        if not claims_to_process: logging.warning("Prioritization failed."); return {"processed_claims":[], "non_checkable_claims":non_checkable_sents, "summary":"Prioritization failed.", "raw_fact_checks":{}, "raw_searches":{}}
+        if not checkable_claims_initial_data:
+            logging.warning("No checkable claims found after preprocessing.");
+            return {"processed_claims":[], "non_checkable_claims":non_checkable_sents, "summary":"No checkable claims found.", "raw_fact_checks":{}, "raw_searches":{}}
 
-        logging.info("Step 3: Queueing..."); self.add_claims_to_queue(claims_to_process) # Queue the dicts
-        logging.info("Step 4: Processing via Workers..."); # Worker logic same
-        threads=[]; n_cpu=os.cpu_count() or 1; n_workers=min(num_workers,self.claim_queue.qsize(),n_cpu)
-        if n_workers>0:
-            logging.info(f"Starting {n_workers} workers...");
-            for i in range(n_workers): t=Thread(target=self.worker,name=f"Worker-{i+1}",daemon=True); t.start(); threads.append(t)
-            self.claim_queue.join(); logging.info("Workers finished.")
-        else: logging.info("No claims queued, processing skipped.")
-
-        # Ensure all threads are finished before proceeding (join might return early if queue empty)
-        for t in threads:
-            t.join(timeout=5.0) # Wait a bit longer if needed
-            if t.is_alive():
-                 logging.warning(f"Thread {t.name} still alive after join timeout.")
+        logging.info("Step 2: Prioritizing Checkable Claims...");
+        prioritized_claims_data=self.classify_and_prioritize_claims(checkable_claims_initial_data)
+        if not prioritized_claims_data:
+             logging.warning("Prioritization failed."); # Should return empty list if input was empty
+             # Proceed with empty list if prioritization itself failed? Or return error?
+             # For now, proceed, assuming classify_and_prioritize handles internal errors.
+             return {"processed_claims":[], "non_checkable_claims":non_checkable_sents, "summary":"Prioritization failed.", "raw_fact_checks":{}, "raw_searches":{}}
 
 
-        # 5. Generate SHAP (after processing)
-        logging.info("Step 5: Generating SHAP (if installed)..."); self.train_and_run_shap(claims_to_process)
+        logging.info("Step 3: Checking Knowledge Graph (Neo4j)...");
+        claims_to_process_fully = []
+        claims_found_in_kg = []
+        for claim_data_dict in prioritized_claims_data:
+             # Use preprocessed text for KG lookup
+             preprocessed_claim_text = claim_data_dict.get('preprocessed_claim')
+             if not preprocessed_claim_text:
+                  logging.warning(f"Skipping KG check for claim with no preprocessed text: '{claim_data_dict.get('original_claim')}'")
+                  claims_to_process_fully.append(claim_data_dict) # Process fully if preprocessing failed
+                  continue
 
-        # 6. Consolidate Results (Final results dict generation)
-        logging.info("Step 6: Consolidating final results..."); results_list=[]; ok_count=0; err_count=0
+             kg_result = self.check_kg_for_claim(preprocessed_claim_text)
+
+             if kg_result:
+                 # Use the result found in the KG
+                 claims_found_in_kg.append(kg_result)
+                 # Add raw results from KG entry if needed? Not straightforward.
+             else:
+                 # Not found or error in KG, needs full processing
+                 claims_to_process_fully.append(claim_data_dict)
+
+        logging.info(f"KG Check Results: Found={len(claims_found_in_kg)}, Needs Full Processing={len(claims_to_process_fully)}")
+
+        # --- Step 4: Process Claims needing Full Pipeline ---
+        if claims_to_process_fully:
+            logging.info("Step 4a: Queueing claims for full processing...");
+            self.add_claims_to_queue(claims_to_process_fully)
+
+            logging.info("Step 4b: Processing via Workers...");
+            threads=[]; n_cpu=os.cpu_count() or 1;
+            # Limit workers by available CPUs and queue size
+            n_workers=min(num_workers, self.claim_queue.qsize(), n_cpu)
+            if n_workers > 0:
+                logging.info(f"Starting {n_workers} workers...");
+                for i in range(n_workers): t=Thread(target=self.worker,name=f"Worker-{i+1}",daemon=True); t.start(); threads.append(t)
+                self.claim_queue.join(); logging.info("Workers finished processing queue.")
+                # Join threads explicitly after queue join to ensure completion
+                for t in threads:
+                    t.join(timeout=10.0) # Generous timeout
+                    if t.is_alive(): logging.warning(f"Thread {t.name} still alive after join!")
+            else:
+                 logging.info("No claims needed full processing via workers.")
+        else:
+            logging.info("Step 4: Skipping full pipeline processing (all claims found in KG or none checkable).")
+
+        # --- Step 5: Generate SHAP (only for fully processed claims) ---
+        logging.info("Step 5: Generating SHAP (if installed)...");
+        # Pass only the claims that *were* fully processed to SHAP
+        self.train_and_run_shap(claims_to_process_fully) # SHAP runs on original data structure
+
+        # --- Step 6: Consolidate Results ---
+        logging.info("Step 6: Consolidating final results...");
+        final_results_list = []
+        processed_count = 0
+        error_count = 0
+
+        # Add results from KG directly
+        final_results_list.extend(claims_found_in_kg)
+        processed_count += len(claims_found_in_kg)
+
+        # Add results from the full pipeline processing (from self.results)
         with self.results_lock:
-            # Ensure results are populated after workers finish
-            processed_claims_keys = list(self.results.keys())
-            logging.debug(f"Keys in self.results after workers: {processed_claims_keys}")
-
-            for cd in claims_to_process: # Iterate through original list of dicts
+            for cd in claims_to_process_fully: # Iterate through claims sent to workers
                  original_claim = cd['original_claim']
-                 res = self.results.get(original_claim) # Fetch processed result
-                 if res:
-                      results_list.append(res); ok_count+=1
-                      # Count errors based on final verdict state
-                      if res.get("final_verdict", "").startswith(("Error","LLM Error","Processing Error","Missing")): err_count+=1
-                 else: logging.error(f"Result missing: '{original_claim}'. Adding error entry."); results_list.append({"original_claim":original_claim,"final_verdict":"Missing Result","final_explanation":"Result lost during processing."}); err_count+=1
+                 pipeline_result = self.results.get(original_claim)
+                 if pipeline_result:
+                      final_results_list.append(pipeline_result)
+                      processed_count += 1
+                      if pipeline_result.get("source") == "Error" or "Error" in pipeline_result.get("final_verdict",""):
+                           error_count += 1
+                 else:
+                      # This should ideally not happen if workers store results/errors
+                      logging.error(f"Result missing from self.results for fully processed claim: '{original_claim}'. Adding error entry.")
+                      final_results_list.append({
+                          "original_claim": original_claim,
+                          "preprocessed_claim": cd.get('preprocessed_claim','?'),
+                          "final_verdict": "Missing Result",
+                          "final_explanation": "Result lost after worker processing.",
+                          "source": "Error"
+                          })
+                      error_count += 1
 
-        summary=self.generate_chain_of_thought(claims_to_process, non_checkable_sents) # Generate CoT summary
+        # Sort final list? Maybe by original order or priority? For now, KG first then pipeline.
+        # Re-sort by original text order might be good for consistency? Or keep KG first?
+        # Let's keep KG first, then pipeline results (order might be worker-dependent)
+
+        # --- Step 7: Generate Summary ---
+        # Pass the combined list to generate the summary
+        summary = self.generate_chain_of_thought(final_results_list, non_checkable_sents)
+
         duration = time.time() - start
-        logging.info(f"Check complete. Processed {ok_count} checkable claims ({err_count} errors) in {duration:.2f}s.")
+        logging.info(f"Check complete. Total checkable claims={len(prioritized_claims_data)}, KG Hits={len(claims_found_in_kg)}, Fully Processed={processed_count - len(claims_found_in_kg)}, Errors={error_count} in {duration:.2f}s.")
+
         # Return all relevant data structures
-        return {"processed_claims":results_list, "non_checkable_claims":non_checkable_sents, "summary":summary, "raw_fact_checks":self.raw_fact_checks, "raw_searches":self.raw_searches, "shap_explanations": self.shap_explanations} # Return SHAP results too
+        return {
+            "processed_claims": final_results_list, # Combined results
+            "non_checkable_claims": non_checkable_sents,
+            "summary": summary,
+            "raw_fact_checks": self.raw_fact_checks, # Only contains results for fully processed claims
+            "raw_searches": self.raw_searches,       # Only contains results for fully processed claims
+            "shap_explanations": self.shap_explanations # Only contains results for fully processed claims
+            }
 
     def close_neo4j(self):
         """Closes the Neo4j driver connection."""
@@ -748,48 +1034,62 @@ if __name__ == "__main__":
     checker = None # Initialize checker outside try
     try:
         checker = FactChecker()
+        # Initialization includes Neo4j connection test now
         if checker.neo4j_driver is None:
-            print("\nCRIT ERR: Neo4j driver failed to initialize. Check URI, credentials, and DB name. Exiting.")
+            print("\nCRIT ERR: Neo4j driver failed to initialize. Check logs. Exiting.")
+            # Logs should contain the specific connection/auth error
             exit(1)
         print("Fact Checker Initialized Successfully.")
-    except RuntimeError as e: logging.critical(f"Init fail: {e}",exc_info=True); print(f"\nCRIT ERR: Init failed. Logs:{log_file}. Err:{e}"); exit(1)
-    except Exception as e: logging.critical(f"Unexpected init err: {e}",exc_info=True); print(f"\nCRIT UNEXPECTED init err. Logs:{log_file}. Err:{e}"); exit(1)
+    except RuntimeError as e: # Model loading error
+        logging.critical(f"Init fail (Model Load?): {e}",exc_info=True); print(f"\nCRIT ERR: Init failed. Logs:{log_file}. Err:{e}"); exit(1)
+    except Exception as e: # Other unexpected init errors
+        logging.critical(f"Unexpected init err: {e}",exc_info=True); print(f"\nCRIT UNEXPECTED init err. Logs:{log_file}. Err:{e}"); exit(1)
 
-
+    # --- Example Input ---
+    # Run 1: Will likely process most claims fully
+    # Run 2: Should find several claims in the KG if Run 1 was successful
     input_text = (
-        "The Earth is flat according to the Flat Earth Society. The moon is made of green cheese, isn't it? "
-        "COVID-19 vaccines, developed by Pfizer and Moderna, are generally safe and effective according to major health organizations like the WHO in 2023. "
-        "Mars is primarily inhabited by autonomous robots like Curiosity sent from Earth last year. "
-        "Climate change is not happening. I think the weather is beautiful today. "
-        "Paris is the capital of France since 508 AD. This sentence is just filler and probably not factual. "
-        "You must agree with me. London is great."
+        "The Earth is flat according to the Flat Earth Society. The moon is made of green cheese, isn't it? " # Non-checkable Q
+        "COVID-19 vaccines, developed by Pfizer and Moderna, are generally safe and effective according to major health organizations like the WHO in 2023. " # Checkable
+        "Mars is primarily inhabited by autonomous robots like Curiosity sent from Earth last year. " # Checkable
+        "Climate change is not happening. I think the weather is beautiful today. " # Checkable, Non-checkable (Opinion)
+        "Paris is the capital of France since 508 AD. This sentence is just filler and probably not factual. " # Checkable, Non-checkable (Self-ref)
+        "You must agree with me. London is great." # Non-checkable (Imperative), Non-Checkable (Subjective Adj)
+        "The Eiffel Tower is located in Berlin." # New checkable claim for Run 2 example
     )
     print(f"\nInput Text:\n{input_text}\n")
 
 
     print("\n--- Starting Fact Check Pipeline ---\n")
+    # Ensure checker is initialized before calling check
+    if not checker:
+         print("Checker not initialized. Exiting.")
+         exit(1)
+
     results_data = checker.check(input_text, num_workers=2) # checker.check now returns the final dict
 
     # --- OUTPUT ORDER ---
 
-    # 1. Raw Fact Check API Results
+    # 1. Raw Fact Check API Results (Only for claims processed fully)
     print("\n" + "="*25 + " Intermediate Output 1: Raw Google Fact Check API Results " + "="*15)
     if results_data.get("raw_fact_checks"):
         if results_data["raw_fact_checks"]:
+            print(" (Note: Shows results only for claims requiring full API processing)")
             for claim, api_res_list in results_data["raw_fact_checks"].items():
                 print(f"\nClaim (Original): \"{claim}\"")
                 if api_res_list:
                     for res_item in api_res_list: print(f"  - Verdict: {res_item.get('verdict','?')} | Evidence: {res_item.get('evidence','?')}")
                 else: print("  - No result stored (API call likely failed).")
-        else: print("  - No Fact Check API calls were made or stored.")
+        else: print("  - No Fact Check API calls were made or stored (or all claims were KG hits).")
     else: print("  - Raw Fact Check data structure missing.")
     print("="*81)
 
-    # 2. Raw Google Custom Search Snippets (Optional)
+    # 2. Raw Google Custom Search Snippets (Optional, only for claims processed fully)
     SHOW_RAW_SEARCH = False # Keep this False unless debugging search itself
     if SHOW_RAW_SEARCH and results_data.get("raw_searches"):
         print("\n" + "="*25 + " Intermediate Output 2: Raw Google Custom Search Snippets " + "="*14)
         if results_data["raw_searches"]:
+            print(" (Note: Shows results only for claims requiring full API processing)")
             for claim, search_data in results_data["raw_searches"].items():
                 print(f"\nClaim (Original): \"{claim}\""); print(f"  (API Query: \"{search_data.get('query', '?')}\")")
                 search_results = search_data.get("results", [])
@@ -797,7 +1097,7 @@ if __name__ == "__main__":
                     for i, item in enumerate(search_results): print(f"  {i+1}. T: {item.get('title','?')}\n     S: {item.get('snippet','?')}\n     L: {item.get('link','?')}")
                 elif search_data.get("response") is not None: print("  - Search OK, no items.")
                 else: print("  - Search API call likely failed.")
-        else: print("  - No Custom Search API calls were made or stored.")
+        else: print("  - No Custom Search API calls were made or stored (or all claims were KG hits).")
         print("="*81)
 
     # 3. Filtered Non-Checkable Claims
@@ -807,50 +1107,78 @@ if __name__ == "__main__":
     else: print("  - No sentences were filtered out.")
     print("="*81)
 
-    # 4. Detailed Processed Claim Results (Includes NER, RAG Status, Final LLM Verdict)
+    # 4. Detailed Processed Claim Results (Includes KG hits and Fully Processed)
     print("\n" + "="*30 + " Final Processed Claim Details " + "="*30)
     if results_data and results_data.get("processed_claims"):
-        for i, res in enumerate(results_data["processed_claims"]):
-            print(f"\nClaim {i+1} (Original): \"{res.get('original_claim', '?')}\"")
-            print(f"  - Preprocessed for API: \"{res.get('preprocessed_claim', '?')}\"")
-            ner_ents = res.get('ner_entities', [])
-            if ner_ents: print(f"  - NER Entities: {', '.join([f'{e['text']}({e['label']})' for e in ner_ents])}")
-            else: print("  - NER Entities: None Found")
-            print(f"  - Factual Score (0-1): {res.get('factual_score'):.2f}" if res.get('factual_score') is not None else "N/A")
-            print(f"  - Initial Check Result: '{res.get('initial_verdict_raw','?')}'")
-            print(f"  - RAG Status: {res.get('rag_status', '?')}")
-            if res.get('top_rag_snippets'): print("  - Top RAG Snippets:"); [print(f"    {j+1}. {snip}") for j,snip in enumerate(res.get('top_rag_snippets',[]))]
-            else: print("  - Top RAG Snippets: None")
-            print(f"  - Final Verdict (RAG+LLM): {res.get('final_verdict', '?')}") # Emphasize source
-            print(f"  - LLM Justification: {res.get('final_explanation', '?')}")
-            # Indicate Neo4j storage status based on logs
-            if checker and checker.neo4j_driver:
-                 print(f"  - Neo4j Storage: Attempted (Check logs & DB '{NEO4J_DATABASE}')")
+        # Sort results for consistent display (e.g., by original claim text)
+        sorted_results = sorted(results_data["processed_claims"], key=lambda x: x.get('original_claim', ''))
+        for i, res in enumerate(sorted_results):
+            source = res.get('source', '?')
+            print(f"\nClaim {i+1} (Original): \"{res.get('original_claim', '?')}\" [Source: {source}]")
+            print(f"  - Preprocessed: \"{res.get('preprocessed_claim', 'N/A')}\"") # Show preprocessed text
+
+            if source == "Full Pipeline":
+                ner_ents = res.get('ner_entities', [])
+                if ner_ents: print(f"  - NER Entities: {', '.join([f'{e['text']}({e['label']})' for e in ner_ents])}")
+                else: print("  - NER Entities: None Found")
+                print(f"  - Factual Score (0-1): {res.get('factual_score'):.2f}" if res.get('factual_score') is not None else "N/A")
+                print(f"  - Initial Check Result: '{res.get('initial_verdict_raw','?')}'")
+                print(f"  - RAG Status: {res.get('rag_status', '?')}")
+                if res.get('top_rag_snippets'): print("  - Top RAG Snippets:"); [print(f"    {j+1}. {snip}") for j,snip in enumerate(res.get('top_rag_snippets',[]))]
+                else: print("  - Top RAG Snippets: None")
+                print(f"  - Final Verdict (RAG+LLM): {res.get('final_verdict', '?')}")
+                print(f"  - LLM Justification: {res.get('final_explanation', '?')}")
+                if checker and checker.neo4j_driver: print(f"  - Neo4j Storage: Stored/Updated in DB '{NEO4J_DATABASE}'")
+
+            elif source == "Knowledge Graph":
+                print(f"  - Final Verdict (From KG): {res.get('final_verdict', '?')}")
+                print(f"  - KG Explanation: {res.get('final_explanation', '?')}")
+                if 'kg_timestamp' in res: print(f"  - KG Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(res['kg_timestamp']))}" if res['kg_timestamp'] else "N/A")
+
+            elif source == "Error":
+                print(f"  - Final Verdict: {res.get('final_verdict', 'Error')}")
+                print(f"  - Explanation: {res.get('final_explanation', 'N/A')}")
             else:
-                 print("  - Neo4j Storage: Skipped (Driver not available)")
+                 print("  - Unknown processing source or result format.")
 
     else: print("No checkable claims were processed or results available.")
     print("="*83)
 
-    # 5. XAI (SHAP) Summary
+    # 5. XAI (SHAP) Summary (Only for claims processed fully)
     print("\n" + "="*30 + " XAI (SHAP) Summary " + "="*37)
     if results_data.get("shap_explanations"):
-         shap_summary=[]; has_real=False
-         for expl in results_data["shap_explanations"]:
-             v=expl.get('shap_values',[]); s="[Err/Unavail]"
-             if isinstance(v,list) and v:
-                 if all(isinstance(x,(int,float)) for x in v): s=f"[...{len(v)} values]" if not all(abs(y)<1e-9 for y in v) else "[Err Fallback]"; has_real=True if s.startswith("[...") else has_real
-                 else: s=str(v) # Display list content if not numbers
-             elif isinstance(v,str): s=v # Handle string error messages like "[SHAP Embed Err]"
-             elif not v: s="[No Data]"
-             shap_summary.append(f"'{expl.get('claim','?')}': {s}")
-         status = "Generated." if has_real else "Failed/Unavailable."
-         print(f"  - SHAP Status: {status}")
-         if shap_summary: print(f"  - Details: {{{', '.join(shap_summary)}}}")
-         # Add reminder to check log file for errors
-         if not has_real and shap is not None:
-              if any("[SHAP Error" in str(expl.get("shap_values","")) or "[SHAP Embed Err]" in str(expl.get("shap_values","")) for expl in results_data.get("shap_explanations", [])):
-                   print(f"\n  *** SHAP Error Detected: Check '{log_file}' for traceback. ***")
+         # Filter explanations based on claims that actually had SHAP run
+         fully_processed_claims = {p['original_claim'] for p in results_data.get("processed_claims", []) if p.get('source') == 'Full Pipeline'}
+         relevant_explanations = [ex for ex in results_data["shap_explanations"] if ex.get('claim') in fully_processed_claims]
+
+         if relevant_explanations:
+             print(f" (Note: Shows results only for {len(relevant_explanations)} claim(s) requiring full API processing)")
+             shap_summary=[]; has_real=False
+             for expl in relevant_explanations:
+                 v=expl.get('shap_values',[]); s="[Err/Unavail]"
+                 if isinstance(v,list) and v:
+                     # Check if list contains actual numbers vs error strings/placeholders
+                     is_numeric = all(isinstance(x,(int,float)) for x in v)
+                     is_error_fallback = any(isinstance(val, str) and val.startswith('[SHAP') for val in v)
+
+                     if is_numeric and not is_error_fallback:
+                         s=f"[...{len(v)} values]" if not all(abs(y)<1e-9 for y in v) else "[Zero Values]"
+                         has_real=True if s.startswith("[...") else has_real
+                     elif is_error_fallback:
+                          s = v[0] if v else "[SHAP Err Fallback]" # Display first error msg
+                     else: s=str(v) # Display list content if not numbers/errors
+                 elif isinstance(v,str): s=v # Handle top-level error strings
+                 elif not v: s="[No Data]"
+                 shap_summary.append(f"'{expl.get('claim','?')}': {s}")
+             status = "Generated." if has_real else "Failed/Unavailable."
+             print(f"  - SHAP Status: {status}")
+             if shap_summary: print(f"  - Details: {{{', '.join(shap_summary)}}}")
+             # Add reminder to check log file for errors
+             if not has_real and shap is not None and relevant_explanations:
+                  if any("[SHAP Error" in str(expl.get("shap_values","")) or "[SHAP Embed Err]" in str(expl.get("shap_values","")) for expl in relevant_explanations):
+                       print(f"\n  *** SHAP Error Detected: Check '{log_file}' for traceback. ***")
+         else:
+              print("  - SHAP analysis not applicable (no claims required full processing or SHAP failed).")
     else: print("  - SHAP analysis skipped or no results structure.")
     print("="*86)
 
