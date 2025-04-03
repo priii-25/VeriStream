@@ -6,11 +6,11 @@ const RealTimeAnalysis = () => {
   const [streamUrl, setStreamUrl] = useState('');
   const [results, setResults] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [expanded, setExpanded] = useState({}); // For collapsible sections
+  const [expanded, setExpanded] = useState({});
+  const [status, setStatus] = useState('idle'); // idle, processing, ready
   const videoRef = useRef(null);
   const wsRef = useRef(null);
 
-  // WebSocket with reconnection logic
   useEffect(() => {
     const connectWebSocket = () => {
       wsRef.current = new WebSocket('ws://127.0.0.1:5001/api/stream/results');
@@ -19,9 +19,12 @@ const RealTimeAnalysis = () => {
       
       wsRef.current.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        if (data.message !== "Processing...") {
-          setResults((prev) => [...prev.slice(-5), data]); // Keep last 5 chunks
-          setIsLoading(false); // Stop loading once we get results
+        if (data.message === "Processing...") {
+          setStatus('processing');
+        } else {
+          setResults((prev) => [...prev.slice(-5), data]);
+          setStatus('ready');
+          setIsLoading(false);
           if (videoRef.current) {
             videoRef.current.src = data.video_chunk;
             videoRef.current.play().catch(err => console.error('Video play error:', err));
@@ -29,10 +32,7 @@ const RealTimeAnalysis = () => {
         }
       };
       
-      wsRef.current.onerror = (error) => {
-        console.error('WebSocket error:', error);
-      };
-      
+      wsRef.current.onerror = (error) => console.error('WebSocket error:', error);
       wsRef.current.onclose = () => {
         console.log('WebSocket closed, attempting to reconnect...');
         setTimeout(connectWebSocket, 1000);
@@ -40,21 +40,20 @@ const RealTimeAnalysis = () => {
     };
 
     connectWebSocket();
-
-    return () => {
-      if (wsRef.current) wsRef.current.close();
-    };
+    return () => wsRef.current?.close();
   }, []);
 
   const handleStart = async () => {
     try {
       setIsLoading(true);
+      setStatus('idle');
       await axios.post('http://127.0.0.1:5001/api/stream/analyze', {
         url: streamUrl || 'https://www.twitch.tv/iskall85',
       });
     } catch (error) {
       console.error('Error starting stream:', error);
       setIsLoading(false);
+      setStatus('idle');
     }
   };
 
@@ -63,6 +62,7 @@ const RealTimeAnalysis = () => {
       await axios.post('http://127.0.0.1:5001/api/stream/stop');
       setResults([]);
       setIsLoading(false);
+      setStatus('idle');
       if (videoRef.current) videoRef.current.src = '';
     } catch (error) {
       console.error('Error stopping stream:', error);
@@ -83,19 +83,17 @@ const RealTimeAnalysis = () => {
           value={streamUrl}
           onChange={(e) => setStreamUrl(e.target.value)}
         />
-        <button onClick={handleStart} className="start-button">
-          Start Stream
-        </button>
-        <button onClick={handleStop} className="stop-button">
-          Stop Stream
-        </button>
+        <button onClick={handleStart} className="start-button">Start Stream</button>
+        <button onClick={handleStop} className="stop-button">Stop Stream</button>
       </div>
 
       <div className="stream-video">
-        {isLoading ? (
-          <p className="loading-message">Loading stream (skipping initial Twitch loading screen, please wait up to 60 seconds)...</p>
-        ) : (
+        {status === 'processing' ? (
+          <p className="loading-message">Processing stream chunk (may take up to 3 minutes)...</p>
+        ) : status === 'ready' && results.length > 0 ? (
           <video ref={videoRef} controls autoPlay />
+        ) : (
+          <p className="loading-message">Loading stream (skipping initial Twitch loading screen, please wait up to 60 seconds)...</p>
         )}
       </div>
 
@@ -113,8 +111,22 @@ const RealTimeAnalysis = () => {
               <p><strong>Faces Detected:</strong> {result.faces_detected.filter(Boolean).length} out of {result.faces_detected.length} frames</p>
               <p><strong>Transcriptions:</strong></p>
               <ul>
-                <li>First 25 seconds: {result.transcriptions.first_half}</li>
-                <li>Second 25 seconds: {result.transcriptions.second_half}</li>
+                <li>
+                  First 25 seconds:
+                  <ul>
+                    <li>Original: {result.transcriptions.first_half.original}</li>
+                    <li>Language: {result.transcriptions.first_half.detected_language}</li>
+                    <li>English: {result.transcriptions.first_half.english}</li>
+                  </ul>
+                </li>
+                <li>
+                  Second 25 seconds:
+                  <ul>
+                    <li>Original: {result.transcriptions.second_half.original}</li>
+                    <li>Language: {result.transcriptions.second_half.detected_language}</li>
+                    <li>English: {result.transcriptions.second_half.english}</li>
+                  </ul>
+                </li>
               </ul>
 
               {result.fact_check_results?.length > 0 && (

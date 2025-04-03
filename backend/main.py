@@ -306,7 +306,7 @@ async def stream_results(websocket: WebSocket):
     try:
         while True:
             try:
-                result = await asyncio.wait_for(result_queue.get(), timeout=60.0)
+                result = await asyncio.wait_for(result_queue.get(), timeout=180.0)
                 await websocket.send_json(result)
                 logger.info("Sent result over WebSocket")
             except asyncio.TimeoutError:
