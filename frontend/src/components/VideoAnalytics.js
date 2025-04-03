@@ -16,6 +16,7 @@ import {
   Tooltip,
   Legend,
 } from 'chart.js';
+import '../styles/VideoAnalytics.css';
 
 // Register Chart.js components
 ChartJS.register(
@@ -46,6 +47,7 @@ const VideoAnalytics = () => {
   const [videoUrl, setVideoUrl] = useState(null);
   const [translation, setTranslation] = useState(null);
   const [language, setLanguage] = useState('en');
+  const [expanded, setExpanded] = useState(false); // For fact-check collapse
   const wsRef = useRef(null);
 
   const handleFileChange = (event) => {
@@ -162,7 +164,8 @@ const VideoAnalytics = () => {
           {
             label: 'Deepfake Score',
             data: analysisResult.frames_data.max_scores,
-            borderColor: 'blue',
+            borderColor: '#007bff',
+            backgroundColor: 'rgba(0, 123, 255, 0.2)',
             fill: false,
           },
         ],
@@ -176,7 +179,9 @@ const VideoAnalytics = () => {
           {
             label: 'Score Distribution',
             data: analysisResult.frames_data.max_scores,
-            backgroundColor: 'rgba(55, 83, 109, 0.5)',
+            backgroundColor: 'rgba(0, 123, 255, 0.5)',
+            borderColor: '#007bff',
+            borderWidth: 1,
           },
         ],
       }
@@ -184,10 +189,13 @@ const VideoAnalytics = () => {
 
   const chartOptions = {
     responsive: true,
-    plugins: { legend: { position: 'top' }, title: { display: true } },
+    plugins: {
+      legend: { position: 'top', labels: { color: '#ffffff' } },
+      title: { display: true, color: '#ffffff' },
+    },
     scales: {
-      x: { title: { display: true, text: 'Time (s)' } },
-      y: { title: { display: true, text: 'Score' }, beginAtZero: true, max: 1 },
+      x: { title: { display: true, text: 'Time (s)', color: '#ffffff' }, ticks: { color: '#ffffff' } },
+      y: { title: { display: true, text: 'Score', color: '#ffffff' }, ticks: { color: '#ffffff' }, beginAtZero: true, max: 1 },
     },
   };
 
@@ -199,10 +207,10 @@ const VideoAnalytics = () => {
     })) || [];
 
   return (
-    <div style={{ padding: '20px', fontFamily: 'Arial, sans-serif' }}>
+    <div className="video-analytics-container">
       <h1>Video Analytics</h1>
 
-      <form onSubmit={handleSubmit}>
+      <form onSubmit={handleSubmit} className="upload-form">
         <input type="file" accept="video/*" onChange={handleFileChange} disabled={loading} />
         <button type="submit" disabled={loading || !file}>
           {loading ? 'Analyzing...' : 'Analyze Video'}
@@ -210,30 +218,30 @@ const VideoAnalytics = () => {
       </form>
 
       {videoUrl && (
-        <div style={{ marginTop: '20px' }}>
+        <div className="uploaded-video">
           <h3>Uploaded Video</h3>
-          <video src={videoUrl} controls style={{ maxWidth: '640px', height: 'auto' }} />
+          <video src={videoUrl} controls />
         </div>
       )}
 
       {loading && (
-        <div style={{ marginTop: '10px' }}>
+        <div className="progress-section">
           <p>Processing video... ({(progress * 100).toFixed(0)}%)</p>
-          <progress value={progress} max="1" style={{ width: '100%' }} />
+          <progress value={progress} max="1" />
         </div>
       )}
 
       {error && (
-        <div style={{ color: 'red', marginTop: '10px' }}>
+        <div className="error-message">
           <strong>Error:</strong> {error}
         </div>
       )}
 
       {analysisResult && (
-        <div style={{ marginTop: '20px' }}>
+        <div className="results-section">
           <h2>Analysis Results</h2>
 
-          <div>
+          <div className="card">
             <strong>Original Transcription ({analysisResult.detected_language}):</strong>{' '}
             {analysisResult.original_transcription || 'No transcription available'}
             {analysisResult.detected_language !== "en" && (
@@ -242,12 +250,8 @@ const VideoAnalytics = () => {
                 {analysisResult.english_transcription}
               </div>
             )}
-            <div>
-              <select
-                value={language}
-                onChange={(e) => setLanguage(e.target.value)}
-                style={{ margin: '10px' }}
-              >
+            <div className="translate-section">
+              <select value={language} onChange={(e) => setLanguage(e.target.value)}>
                 <option value="en">English</option>
                 <option value="es">Spanish</option>
                 <option value="fr">French</option>
@@ -277,25 +281,25 @@ const VideoAnalytics = () => {
             </div>
           </div>
 
-          <div>
+          <div className="card">
             <strong>Final Deepfake Score:</strong>{' '}
-            {analysisResult.final_score ? analysisResult.final_score.toFixed(2) : 'N/A'}
+            <span className="highlight">{analysisResult.final_score ? analysisResult.final_score.toFixed(2) : 'N/A'}</span>
           </div>
 
           {summaryMetrics && (
-            <div style={{ marginTop: '10px' }}>
+            <div className="card">
               <h3>Summary Metrics</h3>
-              <p>Average Score: {summaryMetrics.avgScore.toFixed(2)}</p>
-              <p>Peak Score: {summaryMetrics.peakScore.toFixed(2)}</p>
+              <p>Average Score: <span className="highlight">{summaryMetrics.avgScore.toFixed(2)}</span></p>
+              <p>Peak Score: <span className="highlight">{summaryMetrics.peakScore.toFixed(2)}</span></p>
               <p>Total Frames Analyzed: {summaryMetrics.frameCount}</p>
-              <p style={{ color: summaryMetrics.alert.includes('High') ? 'red' : 'green' }}>
+              <p className={summaryMetrics.alert.includes('High') ? 'alert-high' : 'alert-low'}>
                 {summaryMetrics.alert}
               </p>
             </div>
           )}
 
           {lineChartData && (
-            <div style={{ marginTop: '20px' }}>
+            <div className="chart-container">
               <h3>Deepfake Detection Over Time</h3>
               <Line
                 data={lineChartData}
@@ -308,7 +312,7 @@ const VideoAnalytics = () => {
           )}
 
           {barChartData && (
-            <div style={{ marginTop: '20px' }}>
+            <div className="chart-container">
               <h3>Score Distribution</h3>
               <Bar
                 data={barChartData}
@@ -322,145 +326,145 @@ const VideoAnalytics = () => {
           )}
 
           {analysisResult.frames_data?.timestamps?.length > 0 && (
-            <div>
+            <div className="card">
               <strong>Frame Analysis ({analysisResult.frames_data.timestamps.length} frames):</strong>
               <ul>
                 {analysisResult.frames_data.timestamps.map((timestamp, index) => (
                   <li key={index}>
                     Timestamp: {timestamp.toFixed(2)}s, Deepfake Score:{' '}
-                    {(analysisResult.frames_data.max_scores[index] || 0).toFixed(2)}, Face Detected:{' '}
+                    <span className="highlight">{(analysisResult.frames_data.max_scores[index] || 0).toFixed(2)}</span>, Face Detected:{' '}
                     {analysisResult.frames_data.faces_detected[index] ? 'Yes' : 'No'}
                   </li>
                 ))}
               </ul>
-              <button onClick={handleDownload} style={{ marginTop: '10px' }}>
+              <button onClick={handleDownload} className="download-button">
                 Download Results as CSV
               </button>
             </div>
           )}
 
           {analysisResult.text_analysis?.fact_check_result && (
-            <div style={{ marginTop: '20px' }}>
+            <div className="card fact-check-section">
               <h3>Fact Check Analysis</h3>
+              <button onClick={() => setExpanded(!expanded)}>
+                {expanded ? 'Hide Details' : 'Show Details'}
+              </button>
+              {expanded && (
+                <>
+                  <div>
+                    <h4>Raw Google Fact Check API Results</h4>
+                    {analysisResult.text_analysis.fact_check_result.raw_fact_checks &&
+                    Object.keys(analysisResult.text_analysis.fact_check_result.raw_fact_checks).length > 0 ? (
+                      Object.entries(analysisResult.text_analysis.fact_check_result.raw_fact_checks).map(([claim, results], idx) => (
+                        <div key={idx}>
+                          <p><strong>Claim:</strong> "{claim}"</p>
+                          <ul>
+                            {results.map((res, i) => (
+                              <li key={i}>Verdict: {res.verdict} | Evidence: {res.evidence}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ))
+                    ) : (
+                      <p>No raw fact check data available.</p>
+                    )}
+                  </div>
 
-              {/* Raw Google Fact Check API Results */}
-              <div>
-                <h4>Raw Google Fact Check API Results</h4>
-                {analysisResult.text_analysis.fact_check_result.raw_fact_checks &&
-                Object.keys(analysisResult.text_analysis.fact_check_result.raw_fact_checks).length > 0 ? (
-                  Object.entries(analysisResult.text_analysis.fact_check_result.raw_fact_checks).map(([claim, results], idx) => (
-                    <div key={idx}>
-                      <p><strong>Claim:</strong> "{claim}"</p>
+                  <div>
+                    <h4>Filtered Non-Checkable Sentences</h4>
+                    {analysisResult.text_analysis.fact_check_result.non_checkable_claims?.length > 0 ? (
                       <ul>
-                        {results.map((res, i) => (
-                          <li key={i}>Verdict: {res.verdict} | Evidence: {res.evidence}</li>
+                        {analysisResult.text_analysis.fact_check_result.non_checkable_claims.map((sentence, idx) => (
+                          <li key={idx}>"{sentence}"</li>
                         ))}
                       </ul>
-                    </div>
-                  ))
-                ) : (
-                  <p>No raw fact check data available.</p>
-                )}
-              </div>
+                    ) : (
+                      <p>No sentences were filtered out.</p>
+                    )}
+                  </div>
 
-              {/* Filtered Non-Checkable Sentences */}
-              <div style={{ marginTop: '10px' }}>
-                <h4>Filtered Non-Checkable Sentences</h4>
-                {analysisResult.text_analysis.fact_check_result.non_checkable_claims?.length > 0 ? (
-                  <ul>
-                    {analysisResult.text_analysis.fact_check_result.non_checkable_claims.map((sentence, idx) => (
-                      <li key={idx}>"{sentence}"</li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p>No sentences were filtered out.</p>
-                )}
-              </div>
-
-              {/* Processed Claim Details */}
-              <div style={{ marginTop: '10px' }}>
-                <h4>Processed Claim Details</h4>
-                {analysisResult.text_analysis.fact_check_result.processed_claims?.length > 0 ? (
-                  analysisResult.text_analysis.fact_check_result.processed_claims.map((claim, idx) => (
-                    <div key={idx} style={{ marginBottom: '10px' }}>
-                      <p><strong>Claim {idx + 1} (Original):</strong> "{claim.original_claim}" [Source: {claim.source}]</p>
-                      <p>Preprocessed: "{claim.preprocessed_claim}"</p>
-                      {claim.source === "Knowledge Graph" ? (
-                        <>
-                          <p>Final Verdict (From KG): {claim.final_verdict}</p>
-                          <p>KG Explanation: {claim.final_explanation}</p>
-                          {claim.kg_timestamp && (
-                            <p>KG Timestamp: {new Date(claim.kg_timestamp * 1000).toLocaleString()}</p>
+                  <div>
+                    <h4>Processed Claim Details</h4>
+                    {analysisResult.text_analysis.fact_check_result.processed_claims?.length > 0 ? (
+                      analysisResult.text_analysis.fact_check_result.processed_claims.map((claim, idx) => (
+                        <div key={idx}>
+                          <p><strong>Claim {idx + 1} (Original):</strong> "{claim.original_claim}" [Source: {claim.source}]</p>
+                          <p>Preprocessed: "{claim.preprocessed_claim}"</p>
+                          {claim.source === "Knowledge Graph" ? (
+                            <>
+                              <p>Final Verdict (From KG): <span className="highlight">{claim.final_verdict}</span></p>
+                              <p>KG Explanation: {claim.final_explanation}</p>
+                              {claim.kg_timestamp && (
+                                <p>KG Timestamp: {new Date(claim.kg_timestamp * 1000).toLocaleString()}</p>
+                              )}
+                            </>
+                          ) : claim.source === "Full Pipeline" ? (
+                            <>
+                              <p>NER Entities: {claim.ner_entities.length > 0 ? claim.ner_entities.map(e => `${e.text} (${e.label})`).join(', ') : 'None'}</p>
+                              <p>Factual Score: {claim.factual_score?.toFixed(2) || 'N/A'}</p>
+                              <p>Initial Check: {claim.initial_verdict_raw}</p>
+                              <p>RAG Status: {claim.rag_status}</p>
+                              {claim.top_rag_snippets.length > 0 && (
+                                <div>
+                                  <p>Top RAG Snippets:</p>
+                                  <ul>
+                                    {claim.top_rag_snippets.map((snippet, i) => (
+                                      <li key={i}>{snippet}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                              <p>Final Verdict (RAG+LLM): <span className="highlight">{claim.final_verdict}</span></p>
+                              <p>LLM Justification: {claim.final_explanation}</p>
+                            </>
+                          ) : (
+                            <p className="alert-high">Error: {claim.final_explanation}</p>
                           )}
-                        </>
-                      ) : claim.source === "Full Pipeline" ? (
-                        <>
-                          <p>NER Entities: {claim.ner_entities.length > 0 ? claim.ner_entities.map(e => `${e.text} (${e.label})`).join(', ') : 'None'}</p>
-                          <p>Factual Score: {claim.factual_score?.toFixed(2) || 'N/A'}</p>
-                          <p>Initial Check: {claim.initial_verdict_raw}</p>
-                          <p>RAG Status: {claim.rag_status}</p>
-                          {claim.top_rag_snippets.length > 0 && (
-                            <div>
-                              <p>Top RAG Snippets:</p>
-                              <ul>
-                                {claim.top_rag_snippets.map((snippet, i) => (
-                                  <li key={i}>{snippet}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          )}
-                          <p>Final Verdict (RAG+LLM): {claim.final_verdict}</p>
-                          <p>LLM Justification: {claim.final_explanation}</p>
-                        </>
-                      ) : (
-                        <p>Error: {claim.final_explanation}</p>
-                      )}
-                    </div>
-                  ))
-                ) : (
-                  <p>No processed claims available.</p>
-                )}
-              </div>
+                        </div>
+                      ))
+                    ) : (
+                      <p>No processed claims available.</p>
+                    )}
+                  </div>
 
-              {/* SHAP Explanations */}
-              <div style={{ marginTop: '10px' }}>
-                <h4>XAI (SHAP) Summary</h4>
-                {analysisResult.text_analysis.fact_check_result.shap_explanations?.length > 0 ? (
-                  <ul>
-                    {analysisResult.text_analysis.fact_check_result.shap_explanations.map((ex, idx) => (
-                      <li key={idx}>
-                        "{ex.claim}": {typeof ex.shap_values === 'string' ? ex.shap_values : '[SHAP Values Available]'}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p>SHAP analysis skipped or no results.</p>
-                )}
-              </div>
+                  <div>
+                    <h4>XAI (SHAP) Summary</h4>
+                    {analysisResult.text_analysis.fact_check_result.shap_explanations?.length > 0 ? (
+                      <ul>
+                        {analysisResult.text_analysis.fact_check_result.shap_explanations.map((ex, idx) => (
+                          <li key={idx}>
+                            "{ex.claim}": {typeof ex.shap_values === 'string' ? ex.shap_values : '[SHAP Values Available]'}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p>SHAP analysis skipped or no results.</p>
+                    )}
+                  </div>
 
-              {/* Chain of Thought Summary */}
-              <div style={{ marginTop: '10px' }}>
-                <h4>Chain of Thought Summary</h4>
-                <pre style={{ whiteSpace: 'pre-wrap' }}>{analysisResult.text_analysis.fact_check_result.summary || 'No summary available.'}</pre>
-              </div>
+                  <div>
+                    <h4>Chain of Thought Summary</h4>
+                    <pre>{analysisResult.text_analysis.fact_check_result.summary || 'No summary available.'}</pre>
+                  </div>
+                </>
+              )}
             </div>
           )}
 
           {analysisResult.text_analysis?.knowledge_graph && (
-            <div style={{ marginTop: '20px' }}>
+            <div className="card knowledge-graph-section">
               <h3>Knowledge Graph</h3>
               <iframe
                 src="http://127.0.0.1:5001/knowledge_graph"
-                style={{ width: '100%', height: '400px', border: 'none' }}
                 title="Knowledge Graph"
               />
             </div>
           )}
 
           {locations.length > 0 && (
-            <div style={{ marginTop: '20px' }}>
+            <div className="card">
               <h3>Geospatial Map</h3>
-              <MapContainer center={[51.505, -0.09]} zoom={2} style={{ height: '400px', width: '100%' }}>
+              <MapContainer center={[51.505, -0.09]} zoom={2} className="map-container">
                 <TileLayer
                   url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                   attribution='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -475,16 +479,16 @@ const VideoAnalytics = () => {
           )}
 
           {analysisResult.text_analysis && (
-            <div>
+            <div className="card">
               <strong>Text Analysis:</strong>
               <ul>
                 <li>
                   Political Bias: {analysisResult.text_analysis.political_bias?.label || 'N/A'} (Score:{' '}
-                  {analysisResult.text_analysis.political_bias?.score?.toFixed(2) || 'N/A'})
+                  <span className="highlight">{analysisResult.text_analysis.political_bias?.score?.toFixed(2) || 'N/A'}</span>)
                 </li>
                 <li>
                   Manipulation Score:{' '}
-                  {analysisResult.text_analysis.manipulation_score?.toFixed(2) || 'N/A'}
+                  <span className="highlight">{analysisResult.text_analysis.manipulation_score?.toFixed(2) || 'N/A'}</span>
                 </li>
                 <li>
                   Emotional Triggers:{' '}

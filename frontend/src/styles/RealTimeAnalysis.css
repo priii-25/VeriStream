@@ -1,0 +1,125 @@
+/* RealTimeAnalysis.css */
+.realtime-analysis-container {
+    background-color: #000000;
+    color: #ffffff;
+    font-family: 'Roboto', sans-serif;
+    padding: 20px;
+    min-height: 100vh;
+  }
+  
+  .realtime-analysis-container h2,
+  .realtime-analysis-container h3,
+  .realtime-analysis-container h4,
+  .realtime-analysis-container h5 {
+    color: #ffffff;
+    margin-bottom: 15px;
+  }
+  
+  .stream-input-section {
+    display: flex;
+    align-items: center;
+    margin-bottom: 20px;
+  }
+  
+  .stream-input-section input {
+    width: 300px;
+    padding: 10px;
+    background-color: #1a1a1a;
+    border: 1px solid #333;
+    color: #ffffff;
+    border-radius: 5px;
+    margin-right: 10px;
+  }
+  
+  .stream-input-section button {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background-color 0.3s;
+  }
+  
+  .start-button {
+    background-color: #007bff;
+    color: #ffffff;
+  }
+  
+  .start-button:hover {
+    background-color: #0056b3;
+  }
+  
+  .stop-button {
+    background-color: #ff4444;
+    color: #ffffff;
+  }
+  
+  .stop-button:hover {
+    background-color: #cc3333;
+  }
+  
+  .loading-message {
+    color: #ffffff;
+  }
+  
+  .stream-video video {
+    width: 640px;
+    height: 360px;
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(255, 255, 255, 0.1);
+  }
+  
+  .results-section {
+    margin-top: 20px;
+  }
+  
+  .result-card {
+    background-color: #1a1a1a;
+    border-radius: 10px;
+    padding: 15px;
+    margin-bottom: 15px;
+    box-shadow: 0 4px 8px rgba(255, 255, 255, 0.1);
+  }
+  
+  .result-card p,
+  .result-card li {
+    margin: 5px 0;
+  }
+  
+  .result-card ul {
+    list-style-type: none;
+    padding-left: 20px;
+  }
+  
+  .result-card ul li::before {
+    content: "•";
+    color: #007bff;
+    display: inline-block;
+    width: 1em;
+    margin-left: -1em;
+  }
+  
+  .fact-check-section button {
+    background-color: #333;
+    color: #007bff;
+    border: none;
+    padding: 8px 15px;
+    border-radius: 5px;
+    cursor: pointer;
+    margin-top: 10px;
+    transition: background-color 0.3s;
+  }
+  
+  .fact-check-section button:hover {
+    background-color: #444;
+  }
+  
+  .fact-check-section pre {
+    background-color: #222;
+    padding: 10px;
+    border-radius: 5px;
+    white-space: pre-wrap;
+  }
+  
+  .highlight {
+    color: #007bff;
+  }
