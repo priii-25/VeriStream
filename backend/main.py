@@ -728,116 +728,84 @@ async def video_progress_websocket(websocket: WebSocket):
 
 @app.post("/api/video/analyze")
 async def analyze_video_upload(file: UploadFile = File(...)):
-    """Analyzes an uploaded video file (original logic)."""
-    # Use a unique temp path for each upload
-    temp_path = os.path.join(TEMP_DIR, f"upload_{int(time.time())}_{file.filename}")
+    """Analyzes an uploaded video file (direct analysis path)."""
+    # Ensure unique path in TEMP_DIR
+    safe_filename = "".join(c if c.isalnum() else "_" for c in os.path.splitext(file.filename)[0])
+    temp_path = os.path.join(TEMP_DIR, f"upload_{int(time.time())}_{safe_filename}.mp4") # Assuming mp4 upload or handle extensions
     logger.info(f"Received video upload: {file.filename}, saving to {temp_path}")
 
     try:
-        # Save uploaded file asynchronously
-        async with open(temp_path, "wb") as f:
-            content = await file.read() # Read full file content
-            await f.write(content)
-        logger.info(f"Saved uploaded file: {temp_path}, size: {len(content)} bytes")
-        await broadcast_progress(0.05) # Initial progress
+        # Save uploaded file (consider chunking for large files if needed)
+        # Using async write here
+        with open(temp_path, "wb") as f:
+            while content := await file.read(1024 * 1024): # Read in 1MB chunks
+                 f.write(content)
+        logger.info(f"Saved uploaded file: {temp_path}")
+        await broadcast_progress(0.05)
 
-        # --- Original Analysis Steps for Upload (using Kafka/Spark or direct) ---
-
-        # Option 1: Using Kafka Producer + Spark Consumer (as in original)
-        # frame_info = video_producer.process_video(temp_path) # Sends frames to Kafka
-        # total_frames = frame_info["total_frames"]
-        # logger.info(f"Sent {total_frames} frames to Kafka topic 'video-frames'")
-        # await broadcast_progress(0.1)
-        # # Consume results from Spark via Kafka
-        # spark_results = await asyncio.to_thread(consume_spark_results, temp_path, timeout=120) # Increased timeout
-        # await broadcast_progress(0.5)
-        # if not spark_results: # Fallback if Spark fails/times out
-        #      logger.warning("Spark processing failed or timed out. Falling back to direct analysis.")
-        #      # Run direct analysis (similar to original fallback)
-        #      transcription, final_score, frames_data, detected_language = await asyncio.to_thread(
-        #          video_analyzer.analyze_video, temp_path # video_analyzer.analyze_video needs deepfake detector internally
-        #      )
-        #      english_transcription = await translate_to_english(transcription, detected_language)
-        # else:
-        #      # Process Spark results (as in original)
-        #      logger.info(f"Received {len(spark_results)} results from Spark.")
-        #      frames_data = { # Reconstruct frame data from Spark results
-        #          "timestamps": [r.get("timestamp", 0.0) for r in spark_results],
-        #          "max_scores": [r.get("deepfake_score", 0.0) for r in spark_results],
-        #          "faces_detected": [True] * len(spark_results) # Assuming Spark did face detection or placeholder
-        #      }
-        #      final_score = max(frames_data["max_scores"]) if frames_data["max_scores"] else 0.0
-        #      # Need to get transcription separately if Spark doesn't do it
-        #      # Run transcription on the original file (or make Spark do it)
-        #      transcription, _, _, detected_language = await asyncio.to_thread( # Run whisper part only
-        #             video_analyzer.analyze_video, temp_path
-        #      ) # Need to adapt analyze_video or call whisper directly
-        #      english_transcription = await translate_to_english(transcription, detected_language)
-        #      await broadcast_progress(0.6)
-
-
-        # Option 2: Direct Analysis (No Kafka/Spark - Simpler, potentially slower for large files)
-        logger.info("Performing direct analysis on uploaded video...")
+        # --- Direct Analysis (using VideoAnalyzer) ---
+        logger.info("Performing direct analysis via VideoAnalyzer...")
+        num_explanations_to_generate = 5 # How many explanation images to create
         await broadcast_progress(0.1)
-        # video_analyzer.analyze_video includes transcription and deepfake detection now
-        # It should return 4 values: transcription, final_score, frames_data, detected_language
+
+        # Run the potentially long-running analysis in a thread
         transcription, final_score, frames_data, detected_language = await asyncio.to_thread(
-             video_analyzer.analyze_video, temp_path
+             video_analyzer.analyze_video, # Instance created globally
+             temp_path,
+             num_explanations=num_explanations_to_generate # Pass argument here
         )
-        logger.info(f"Direct analysis complete. Score: {final_score}, Lang: {detected_language}")
+        # frames_data now contains scores, timestamps, faces_detected, AND explanations list
+
+        logger.info(f"Video analysis function complete. Score: {final_score:.3f}, Lang: {detected_language}")
+        # Check if explanations were generated
+        if "explanations" in frames_data and frames_data["explanations"]:
+             logger.info(f"Generated {len(frames_data['explanations'])} explanation images.")
+        else:
+             logger.warning("No explanation images were generated.")
+
         await broadcast_progress(0.4)
+
         # Translate transcription if needed
         english_transcription = await translate_to_english(transcription, detected_language)
-        logger.info("Transcription translated to English (if necessary).")
+        logger.info("Transcription processed.")
         await broadcast_progress(0.5)
 
-
-        # --- Common Analysis Steps (Fact Check, Text Analysis) ---
-        logger.info("Running fact-checking on English transcription...")
-        # Use FactChecker instance directly
+        # --- Common Analysis Steps ---
+        logger.info("Running fact-checking...")
         fact_check_result = await asyncio.to_thread(fact_checker.check, english_transcription, num_workers=2)
         processed_claims = fact_check_result.get("processed_claims", [])
-        logger.info(f"Fact-checking complete. Found {len(processed_claims)} processed claims.")
+        logger.info(f"Fact-checking complete.")
         await broadcast_progress(0.7)
 
-        logger.info("Running text analysis on English transcription...")
-        # Use OptimizedAnalyzer instance directly
+        logger.info("Running text analysis...")
         analysis_result = await text_analyzer.analyze_text(english_transcription)
         logger.info("Text analysis complete.")
         await broadcast_progress(0.9)
 
-        # --- Knowledge Graph Update (using FactChecker's KG capability or Analyzer's) ---
-        # FactChecker's check method might already update Neo4j if configured.
-        # Or, use the Analyzer's KG manager if needed. Let's assume FactChecker handles it.
-        # kg_manager = KnowledgeGraphManager() # Not needed if FC does it
-        # kg_manager.visualize_graph(...) # Visualization can be generated if needed
+        await broadcast_progress(1.0)
 
-        await broadcast_progress(1.0) # Done
-
-        # --- Prepare Response ---
+        # --- Prepare Response (including frames_data with explanations) ---
         response = {
             "original_transcription": transcription,
             "detected_language": detected_language,
             "english_transcription": english_transcription,
-            "deepfake_final_score": final_score, # Renamed for clarity
-            "deepfake_frames_data": frames_data, # Renamed for clarity
-            "fact_check_analysis": { # Group fact-check results
+            "deepfake_final_score": final_score,
+            # Send the whole object which now contains the 'explanations' key
+            "deepfake_frames_data": frames_data,
+            "fact_check_analysis": {
                 "processed_claims": processed_claims,
                 "summary": fact_check_result.get("summary", ""),
-                # Add other parts of fact_check_result if needed
             },
-            "text_analysis": { # Group text analysis results
+            "text_analysis": {
                 "political_bias": analysis_result.political_bias,
                 "emotional_triggers": analysis_result.emotional_triggers,
                 "stereotypes": analysis_result.stereotypes,
                 "manipulation_score": analysis_result.manipulation_score,
                 "entities": analysis_result.entities,
                 "locations": analysis_result.locations,
-                # Add knowledge graph link/data if generated and needed
-                # "knowledge_graph_url": f"/{TEMP_DIR}/knowledge_graph_{os.path.basename(temp_path)}.html"
             }
         }
-        logger.info(f"Analysis complete for upload {file.filename}. Sending response.")
+        logger.info(f"Analysis complete for {file.filename}. Sending response.")
         return JSONResponse(content=response)
 
     except FileNotFoundError:
