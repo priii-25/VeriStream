@@ -1,11 +1,10 @@
-# backend/optimized_deepfake_detector.py
+#backend/optimized_deepfake_detector.py
 import torch
 import torch.nn as nn
-from efficientnet_pytorch import EfficientNet
+from transformers import Dinov2Model
+from torchvision import transforms
 import cv2
 import numpy as np
-from facenet_pytorch import MTCNN
-import torch.nn.functional as F
 import logging
 
 # Set up logging
@@ -13,96 +12,70 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('deepfake_detector')
 
 class OptimizedDeepfakeDetector(nn.Module):
-    def __init__(self):
-        """Initialize the deepfake detector with EfficientNet and MTCNN."""
+    def __init__(self, model_path="/Users/kartik/Desktop/vs/VeriStream/backend/dinov2_deepfake_final.pt"):
+        """Initialize the fine-tuned DINOv2 model for deepfake detection on CPU."""
         super().__init__()
         try:
-            self.backbone = EfficientNet.from_pretrained('efficientnet-b4')
-            self.face_detector = MTCNN(
-                keep_all=True,
-                min_face_size=60,
-                thresholds=[0.6, 0.7, 0.7],
-                device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            )
+            self.dinov2 = Dinov2Model.from_pretrained("facebook/dinov2-small")
             self.classifier = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.Linear(1792, 2)
+                nn.Linear(384, 128),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(128, 2)
             )
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.device = torch.device("cpu")  # Explicitly set to CPU
+            # Load fine-tuned weights
+            state_dict = torch.load(model_path, map_location=self.device)
+            self.load_state_dict(state_dict)
             self.to(self.device)
             self.eval()
-            self.batch_size = 16
-
-            if torch.cuda.is_available():
-                self.backbone = self.backbone.half()
-                self.classifier = self.classifier.half()
-            logger.info("Deepfake detector initialized successfully")
+            logger.info(f"DINOv2 Deepfake Detector initialized on {self.device}")
         except Exception as e:
             logger.error(f"Failed to initialize deepfake detector: {str(e)}")
             raise
 
+    def forward(self, x):
+        """Define the forward pass for the model."""
+        features = self.dinov2(x).last_hidden_state[:, 0]  # Extract CLS token
+        logits = self.classifier(features)
+        return logits
+
     @torch.no_grad()
     def process_batch(self, face_batch):
-        """Process a batch of face images."""
+        """Process a batch of face images on CPU."""
         if not face_batch:
             return []
         try:
-            batch_tensor = torch.stack(face_batch).to(self.device)
-            if torch.cuda.is_available():
-                batch_tensor = batch_tensor.half()
-
-            features = self.backbone.extract_features(batch_tensor)
-            outputs = self.classifier(features)
-            scores = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+            batch_tensor = torch.stack(face_batch).to(self.device)  # Already CPU
+            outputs = self(batch_tensor)
+            scores = torch.softmax(outputs, dim=1)[:, 1].numpy()  # No .cpu() needed
             return scores.tolist()
         except Exception as e:
             logger.error(f"Error processing batch: {str(e)}")
             return []
 
+    @torch.no_grad()
     def predict_batch(self, frames):
-        """Predict deepfake scores for a batch of frames."""
-        per_frame_scores = []
-        all_faces = []
-        frame_indices = []
-
+        """Predict deepfake scores for a batch of frames on CPU."""
         try:
-            for frame_idx, frame in enumerate(frames):
-                boxes, _ = self.face_detector.detect(frame)
-                if boxes is not None:
-                    for box in boxes.astype(int):
-                        x1, y1, x2, y2 = box
-                        x1, y1 = max(0, x1), max(0, y1)
-                        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-
-                        if x1 < x2 and y1 < y2:
-                            face = frame[y1:y2, x1:x2]
-                            if face.size != 0:
-                                face = cv2.resize(face, (224, 224))
-                                face = torch.from_numpy(face).permute(2, 0, 1).float() / 255.0
-                                all_faces.append(face)
-                                frame_indices.append(frame_idx)
-
-            per_face_scores = []
-            for i in range(0, len(all_faces), self.batch_size):
-                batch = all_faces[i:i + self.batch_size]
-                scores = self.process_batch(batch)
-                per_face_scores.extend(scores)
-
-            per_frame_scores = [0.0] * len(frames)
-            for idx, face_score in enumerate(per_face_scores):
-                frame_idx = frame_indices[idx]
-                if face_score > per_frame_scores[frame_idx]:
-                    per_frame_scores[frame_idx] = face_score
-
-            return per_frame_scores
+            faces = []
+            for frame in frames:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = cv2.resize(frame, (224, 224))
+                frame = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+                frame = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(frame)
+                faces.append(frame)
+            return self.process_batch(faces)
         except Exception as e:
             logger.error(f"Error predicting batch: {str(e)}")
             return [0.0] * len(frames)
 
-# For testing standalone
+# Test standalone
 if __name__ == "__main__":
-    detector = OptimizedDeepfakeDetector()
-    frame = cv2.imread("test_frame.jpg")
-    scores = detector.predict_batch([frame])
-    print(f"Deepfake scores: {scores}")
+    detector = OptimizedDeepfakeDetector("/Users/kartik/Desktop/vs/VeriStream/backend/dinov2_deepfake_final.pt")
+    frame = cv2.imread("/Users/kartik/Desktop/vs/VeriStream/backend/test.jpeg")
+    if frame is not None:
+        scores = detector.predict_batch([frame])
+        print(f"Deepfake scores: {scores}")
+    else:
+        print("Failed to load test frame")
