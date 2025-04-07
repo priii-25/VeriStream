@@ -1,15 +1,15 @@
 // frontend/src/components/RealTimeAnalysis.js
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import axios from 'axios';
-import '../styles/RealTimeAnalysis.css';
+import '../styles/RealTimeAnalysis.css'; // Ensure this CSS file exists
 
 const RealTimeAnalysis = () => {
     // --- State ---
     const [streamUrl, setStreamUrl] = useState('');
     const [playbackQueue, setPlaybackQueue] = useState([]); // URLs only
     const [analysisDataStore, setAnalysisDataStore] = useState({}); // { chunkIndex: data }
-    const [currentlyPlayingUrl, setCurrentlyPlayingUrl] = useState(null); // For <video> src
-    const [currentlyPlayingIndex, setCurrentlyPlayingIndex] = useState(null); // Index of the playing chunk
+    const [currentlyPlayingUrl, setCurrentlyPlayingUrl] = useState(null);
+    const [currentlyPlayingIndex, setCurrentlyPlayingIndex] = useState(null);
     const [isLoading, setIsLoading] = useState(false);
     const [isPlaying, setIsPlaying] = useState(false);
     const [isFactCheckExpanded, setIsFactCheckExpanded] = useState(false);
@@ -19,26 +19,19 @@ const RealTimeAnalysis = () => {
     const videoRef = useRef(null);
     const wsRef = useRef(null);
     const reconnectTimeoutRef = useRef(null);
-    const processingQueueRef = useRef(false); // Prevent playNext race conditions
+    const processingQueueRef = useRef(false);
 
-    // --- Get current analysis data based on index ---
-    // This derived state avoids needing a separate currentAnalysis state variable
+    // --- Derived State: Get current analysis data ---
     const currentAnalysis = currentlyPlayingIndex !== null ? analysisDataStore[currentlyPlayingIndex] : null;
 
     // --- Play Next Chunk ---
     const playNextInQueue = useCallback(() => {
-        if (processingQueueRef.current) return;
-        processingQueueRef.current = true;
-
+        // Simplified version - actual implementation likely needs more robustness
         setPlaybackQueue(prevQueue => {
             if (prevQueue.length === 0) {
-                console.log("PlayNext: Queue empty.");
                 setIsPlaying(false);
-                // We don't clear currentlyPlayingIndex here, so the last analysis stays visible
-                processingQueueRef.current = false;
                 return [];
             }
-
             const [nextUrl, ...remainingQueue] = prevQueue;
             let chunkIndex = -1;
             try {
@@ -46,151 +39,202 @@ const RealTimeAnalysis = () => {
                 if (match && match[1]) chunkIndex = parseInt(match[1], 10);
             } catch { /* ignore */ }
 
-            console.log(`PlayNext: Dequeuing chunk ${chunkIndex}, URL: ${nextUrl.slice(-30)}`);
-            setCurrentlyPlayingUrl(nextUrl); // Update src
-            setCurrentlyPlayingIndex(chunkIndex); // *** Update index SIMULTANEOUSLY ***
-            setIsFactCheckExpanded(false); // Collapse details
+            setCurrentlyPlayingUrl(nextUrl);
+            setCurrentlyPlayingIndex(chunkIndex);
+            setIsFactCheckExpanded(false); // Collapse details on new chunk
 
-            // Defer video operations
+            // Defer video operations slightly
             setTimeout(() => {
                 if (videoRef.current) {
-                    console.log(`PlayNext: Loading/Playing chunk ${chunkIndex}`);
                     videoRef.current.load();
-                    videoRef.current.play()
-                        .then(() => setIsPlaying(true))
-                        .catch(err => {
-                            console.warn(`PlayNext: Autoplay failed chunk ${chunkIndex}:`, err.name);
-                            setIsPlaying(false);
-                            if (err.name !== 'AbortError') {
-                                setErrorState(`Video Error: ${err.name}.`);
-                            }
-                        });
+                    videoRef.current.play().then(() => setIsPlaying(true)).catch(err => {
+                        console.warn(`Autoplay failed for chunk ${chunkIndex}:`, err.name);
+                        setIsPlaying(false);
+                    });
                 }
-                processingQueueRef.current = false; // Unlock
-            }, 100);
+            }, 50); // Short delay
 
             return remainingQueue;
         });
-    }, [analysisDataStore]); // AnalysisDataStore is needed to update display via derived state
+    }, []); // No dependencies needed if it only modifies state based on prev state
 
     // --- WebSocket Message Handler ---
     const handleWebSocketMessage = useCallback((event) => {
         setErrorState(null);
         try {
             const data = JSON.parse(event.data);
-            // console.log("WS Message:", data);
+            // console.log("WS Message:", data); // DEBUG
 
             if (data && typeof data.chunk_index === 'number' && typeof data.video_chunk_url === 'string') {
                 const chunkIndex = data.chunk_index;
                 const relativeUrl = data.video_chunk_url;
-                const fullUrl = relativeUrl.startsWith('/')
-                    ? `http://127.0.0.1:5001${relativeUrl}` // ** VERIFY PORT **
-                    : relativeUrl;
+                // *** Ensure this matches your backend host/port ***
+                const backendHost = 'http://127.0.0.1:5001';
+                const fullUrl = relativeUrl.startsWith('/') ? `${backendHost}${relativeUrl}` : relativeUrl;
+                // *** Also construct full heatmap URL if present ***
+                const relativeHeatmapUrl = data.deepfake_analysis?.heatmap_url;
+                const fullHeatmapUrl = relativeHeatmapUrl?.startsWith('/') ? `${backendHost}${relativeHeatmapUrl}` : relativeHeatmapUrl;
 
-                // 1. Store analysis data immediately
-                setAnalysisDataStore(prevStore => ({ ...prevStore, [chunkIndex]: data }));
+                // Store analysis data (including the potentially updated heatmap URL)
+                setAnalysisDataStore(prevStore => ({
+                    ...prevStore,
+                    [chunkIndex]: { // Store the *full* data object received
+                       ...data,
+                       // Overwrite heatmap_url with the fully qualified one if it exists
+                       deepfake_analysis: {
+                          ...data.deepfake_analysis,
+                          heatmap_url: fullHeatmapUrl // Store the full URL or undefined
+                       }
+                    }
+                }));
 
-                // 2. Add URL to queue if new
+                // Add video URL to queue if new
                 setPlaybackQueue(prevQueue => {
                     if (!prevQueue.includes(fullUrl)) {
-                        console.log(`Enqueuing chunk ${chunkIndex}`);
+                        console.log(`Enqueuing video chunk ${chunkIndex}`);
                         const newQueue = [...prevQueue, fullUrl];
-                        // 3. Trigger play if queue WAS empty and we are NOT currently playing
-                        // Check isPlaying state directly here, not ref
+                        // Trigger play if queue WAS empty and video isn't already playing
                         if (prevQueue.length === 0 && !isPlaying) {
-                            console.log("Triggering playNextInQueue (WS).");
-                            // No timeout needed, playNextInQueue handles timing
                             playNextInQueue();
                         }
                         return newQueue;
                     }
                     return prevQueue;
                 });
-                setIsLoading(false);
-
-            } else { /* Handle non-chunk messages */ }
+                setIsLoading(false); // Stop loading indicator once first chunk arrives
+            }
         } catch (e) {
-            console.error("WS message error:", e);
-            setErrorState("Error processing WS data.");
+            console.error("WS message processing error:", e);
+            setErrorState("Error processing stream data.");
         }
-    }, [playNextInQueue, isPlaying]); // Added isPlaying dependency
+    }, [playNextInQueue, isPlaying]); // Dependencies
 
     // --- WebSocket Connection ---
     const connectWebSocket = useCallback(() => {
-        // ... (Connection logic identical to previous version) ...
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            console.log('WebSocket already open.');
+            return;
+        }
+        // *** Ensure this matches backend WebSocket endpoint ***
         wsRef.current = new WebSocket('ws://127.0.0.1:5001/api/stream/results');
         console.log('Attempting WebSocket connection...');
-        setErrorState(null);
+        setErrorState(null); // Clear previous errors
 
-        wsRef.current.onopen = () => { /* ... */ };
-        wsRef.current.onerror = (error) => { /* ... setErrorState ... */ };
-        wsRef.current.onclose = (event) => { /* ... reconnect logic ... */ };
+        wsRef.current.onopen = () => {
+            console.log('WebSocket connection established.');
+            if (reconnectTimeoutRef.current) {
+                clearTimeout(reconnectTimeoutRef.current);
+                reconnectTimeoutRef.current = null;
+            }
+        };
+        wsRef.current.onerror = (error) => {
+            console.error('WebSocket error:', error);
+            setErrorState('WebSocket connection error. Check console.');
+            // Don't attempt reconnect immediately on error, wait for close
+        };
+        wsRef.current.onclose = (event) => {
+            console.log(`WebSocket closed (Code: ${event.code}, Reason: ${event.reason})`);
+            if (!event.wasClean && !reconnectTimeoutRef.current) { // Attempt reconnect only if closed unexpectedly
+                console.log('Attempting WebSocket reconnect in 5 seconds...');
+                reconnectTimeoutRef.current = setTimeout(connectWebSocket, 5000);
+            }
+        };
         wsRef.current.onmessage = handleWebSocketMessage;
-    }, [handleWebSocketMessage]); // Dependency
+    }, [handleWebSocketMessage]); // connectWebSocket depends on handleWebSocketMessage
 
-    // Effect for mount/unmount
+    // Effect for initial connection and cleanup
     useEffect(() => {
         connectWebSocket();
-        return () => { /* ... cleanup ... */ };
-    }, [connectWebSocket]);
+        return () => {
+            if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+            if (wsRef.current) {
+                wsRef.current.close(1000, "Component unmounting");
+                wsRef.current = null;
+            }
+        };
+    }, [connectWebSocket]); // Run on mount and if connectWebSocket changes
 
     // --- Video Event Handler ---
     const handleVideoEnded = useCallback(() => {
         console.log(`Video ended: ${currentlyPlayingUrl ? currentlyPlayingUrl.slice(-30) : 'N/A'}`);
         setIsPlaying(false);
-        playNextInQueue();
+        playNextInQueue(); // Automatically play next
     }, [currentlyPlayingUrl, playNextInQueue]);
 
-    // --- API Handlers (Reset state correctly) ---
+    // --- API Handlers (Start/Stop) ---
     const handleStart = async () => {
-        if (!streamUrl) return;
+        if (!streamUrl) { setErrorState("Please enter a stream URL."); return; }
+        if (isLoading) return; // Prevent double clicks
+
+        console.log("Requesting stream start...");
         setIsLoading(true);
         setErrorState(null);
         setPlaybackQueue([]);
         setAnalysisDataStore({});
-        // Reset playing state *before* starting
         setCurrentlyPlayingUrl(null);
         setCurrentlyPlayingIndex(null);
-        // setCurrentAnalysis(null); // Not needed - derived state
         setIsPlaying(false);
         setIsFactCheckExpanded(false);
-        if (videoRef.current) { /* ... reset player ... */ }
+        if (videoRef.current) { videoRef.current.src = ''; videoRef.current.load(); }
 
-        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        // Ensure WebSocket is ready or connecting
+        if (!wsRef.current || wsRef.current.readyState > 1) { // CLOSING or CLOSED
             connectWebSocket();
+            // Optionally wait a very short time for connection attempt? Risky.
+            // Rely on WS message handler to turn off isLoading.
         }
 
         try {
+             // *** Ensure this matches backend API endpoint ***
             await axios.post('http://127.0.0.1:5001/api/stream/analyze', { url: streamUrl });
-            console.log("Start request sent.");
-        } catch (error) { /* ... error handling ... */ }
-        // isLoading will be turned off by WS message handler
+            console.log("Start request sent successfully.");
+            // Don't set isLoading false here, wait for first WS message
+        } catch (error) {
+            console.error("Error starting stream analysis:", error);
+            setErrorState(error.response?.data?.detail || 'Failed to start analysis. Check backend.');
+            setIsLoading(false); // Stop loading on error
+        }
     };
 
     const handleStop = async () => {
-        setIsLoading(true);
+        if (isLoading) return; // Prevent double clicks
+
+        console.log("Requesting stream stop...");
+        setIsLoading(true); // Indicate stopping process
         setErrorState(null);
+
         try {
+            // *** Ensure this matches backend API endpoint ***
             await axios.post('http://127.0.0.1:5001/api/stream/stop');
-            console.log("Stop request sent.");
+            console.log("Stop request sent successfully.");
+
+            // Close WebSocket cleanly from client-side after stop confirmed
             if (wsRef.current) {
                 wsRef.current.close(1000, "User stopped stream");
-                wsRef.current = null;
+                wsRef.current = null; // Nullify ref after closing
             }
-            if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+            if (reconnectTimeoutRef.current) { // Clear any pending reconnect
+                clearTimeout(reconnectTimeoutRef.current);
+                reconnectTimeoutRef.current = null;
+            }
 
-            // Reset state
+            // Reset UI state fully
             setPlaybackQueue([]);
             setAnalysisDataStore({});
-            // setCurrentAnalysis(null); // Derived state clears automatically
             setCurrentlyPlayingUrl(null);
             setCurrentlyPlayingIndex(null);
             setIsPlaying(false);
             setIsFactCheckExpanded(false);
-            if (videoRef.current) { /* ... reset player ... */ }
-        } catch (error) { /* ... error handling ... */ }
-        finally { setIsLoading(false); }
+            if (videoRef.current) { videoRef.current.src = ''; videoRef.current.load(); }
+
+        } catch (error) {
+            console.error("Error stopping stream analysis:", error);
+            setErrorState(error.response?.data?.detail || 'Failed to stop analysis cleanly.');
+            // Still reset UI partially on error? Yes.
+            setIsPlaying(false);
+        } finally {
+            setIsLoading(false); // Stop loading indicator
+        }
     };
 
     // --- Toggle Fact Check ---
@@ -198,23 +242,17 @@ const RealTimeAnalysis = () => {
 
     // --- Render Analysis Details ---
     const renderAnalysisDetails = (analysisData) => {
-        // **Guard Clause First**
         if (!analysisData || analysisData.chunk_index === undefined) {
-             // Display something informative if we are supposed to be playing
-             if (currentlyPlayingUrl && isPlaying) {
-                return <p>Loading analysis data for current chunk...</p>;
-             }
-             return null; // Render nothing otherwise
+             return isPlaying ? <p>Loading analysis data...</p> : null;
         }
 
-        // Destructure *after* the check
         const {
             chunk_index, analysis_timestamp, deepfake_analysis,
             transcription, fact_check_results, fact_check_context_current
         } = analysisData;
 
-        // Log that we are actually rendering
-        console.log(`Rendering analysis for chunk ${chunk_index}`);
+        // Get the full heatmap URL (already constructed in handleWebSocketMessage)
+        const heatmapDisplayUrl = deepfake_analysis?.heatmap_url;
 
         return (
             <>
@@ -225,7 +263,20 @@ const RealTimeAnalysis = () => {
                 <div className="analysis-card">
                     <h5>Deepfake</h5>
                     {deepfake_analysis && deepfake_analysis.timestamp >= 0 ? (
-                        <p>Score: <span className="highlight">{deepfake_analysis.score.toFixed(3)}</span></p>
+                        <>
+                            <p>Score: <span className="highlight">{deepfake_analysis.score.toFixed(3)}</span></p>
+                            {/* Conditionally render heatmap image */}
+                            {heatmapDisplayUrl && (
+                                <div className="heatmap-container">
+                                    <p><strong>Attention Heatmap (if score {'>'} threshold):</strong></p>
+                                    <img
+                                        src={heatmapDisplayUrl}
+                                        alt={`Deepfake Attention Heatmap for chunk ${chunk_index}`}
+                                        className="heatmap-image"
+                                    />
+                                </div>
+                            )}
+                        </>
                     ) : <p>N/A</p>}
                 </div>
 
@@ -244,25 +295,37 @@ const RealTimeAnalysis = () => {
                 </div>
 
                 {/* Fact Check */}
-                {(fact_check_results?.length > 0) && (
+                {(fact_check_results?.length > 0 || fact_check_context_current) && ( // Show card if results exist OR context is current (even if empty)
                     <div className="analysis-card fact-check-section">
                         <h5>
                             Fact Check
                             {fact_check_context_current && <span className="fresh-indicator">(Updated)</span>}
                         </h5>
-                        <button onClick={toggleFactCheckExpand}>
-                            {isFactCheckExpanded ? 'Hide' : 'Show'}
-                        </button>
-                        {isFactCheckExpanded && (
+                        {fact_check_results?.length > 0 && ( // Only show button if there are results to show/hide
+                            <button onClick={toggleFactCheckExpand} className="toggle-button">
+                                {isFactCheckExpanded ? 'Hide' : 'Show'} Details
+                            </button>
+                        )}
+                        {isFactCheckExpanded && fact_check_results?.length > 0 && (
                             <div className="fact-check-details">
                                 {fact_check_results.map((claim, idx) => (
+                                     claim.error ? // Display errors differently
+                                     <div key={idx} className="claim-detail error-detail">
+                                         <p><strong>Fact Check Error:</strong> {claim.error}</p>
+                                     </div>
+                                     :
                                     <div key={idx} className="claim-detail">
                                         <p><strong>Claim {idx + 1}:</strong> "{claim.original_claim || 'N/A'}"</p>
                                         <p>Verdict: <span className="highlight">{claim.final_verdict || 'N/A'}</span></p>
+                                        {/* Optionally show explanation */}
+                                        {/* <p>Explanation: {claim.final_explanation || 'N/A'}</p> */}
                                     </div>
                                 ))}
                             </div>
                         )}
+                         {fact_check_context_current && fact_check_results?.length === 0 && (
+                            <p>No claims found in the latest fact check context.</p>
+                         )}
                     </div>
                 )}
             </>
@@ -277,49 +340,53 @@ const RealTimeAnalysis = () => {
             {/* Input Section */}
             <div className="stream-input-section">
                 <input
-                    type="text" placeholder="Enter Stream URL" value={streamUrl}
+                    type="text" placeholder="Enter Stream URL (e.g., Twitch, YouTube)" value={streamUrl}
                     onChange={(e) => setStreamUrl(e.target.value)}
                     disabled={isLoading || isPlaying || !!currentlyPlayingUrl}
                 />
-                {/* Buttons */}
-                {(!currentlyPlayingUrl && !isPlaying) ? (
+                {/* Buttons - Conditional Rendering based on state */}
+                {(!isPlaying && !currentlyPlayingUrl) ? ( // Show Start only when truly stopped
                     <button onClick={handleStart} disabled={isLoading || !streamUrl} className="start-button">
                         {isLoading ? 'Starting...' : 'Start Analysis'}
                     </button>
-                ) : (
+                ) : ( // Show Stop if playing or has played
                     <button onClick={handleStop} disabled={isLoading} className="stop-button">
                         {isLoading ? 'Stopping...' : 'Stop Analysis'}
                     </button>
                 )}
             </div>
 
-            {/* Display Errors */}
+            {/* Status/Error Display */}
             {errorState && <p className="status-message error">{errorState}</p>}
+            {isLoading && !currentlyPlayingUrl && <p className="status-message info">Starting stream analysis...</p>}
 
             {/* Main Content Area */}
             <div className="content-area">
                 {/* Video Player Area */}
-                <div className="stream-video">
+                <div className="stream-video card"> {/* Added card class */}
                     <h3>Stream Playback</h3>
                     <video
                         ref={videoRef} controls width="100%"
-                        src={currentlyPlayingUrl || ''} // Controlled by state
+                        src={currentlyPlayingUrl || ''}
                         onEnded={handleVideoEnded}
-                        onError={(e) => setErrorState(`Video Error: ${e.target.error?.message || 'Cannot play.'}`)}
-                        onPlay={() => { setIsPlaying(true); setErrorState(null); }} // Update state/clear error
-                        onPause={() => setIsPlaying(false)} // Reflect user pause
-                        // key={currentlyPlayingUrl} // Optional: Uncomment if load() is unreliable
+                        onError={(e) => { console.error("Video Playback Error:", e); setErrorState(`Video Error: ${e.target.error?.message || 'Cannot play video chunk.'}`); setIsPlaying(false); }}
+                        onPlay={() => { setIsPlaying(true); setErrorState(null); }} // Clear error on successful play
+                        onPause={() => setIsPlaying(false)}
+                        muted={false} // Ensure not muted by default, add controls if needed
+                        autoPlay // Attempt autoplay when src changes
                     />
                     {/* Placeholder */}
-                    {!currentlyPlayingUrl && !isLoading && <div className="video-placeholder">Video appears here</div>}
-                    {isLoading && !currentlyPlayingUrl && <div className="video-placeholder">Starting...</div>}
+                    {!currentlyPlayingUrl && !isLoading && <div className="video-placeholder">Video chunks will appear here</div>}
                 </div>
 
                 {/* Analysis Display Area */}
-                <div className="results-section">
-                    <h3>Analysis for Current Video</h3>
-                    {/* Use the derived 'currentAnalysis' state */}
+                <div className="results-section card"> {/* Added card class */}
+                    <h3>Analysis Details</h3>
                     {renderAnalysisDetails(currentAnalysis)}
+                    {/* Show message if playing but analysis hasn't arrived yet */}
+                    {isPlaying && !currentAnalysis && <p>Waiting for analysis of current chunk...</p>}
+                    {/* Show message if stopped and no analysis was ever shown */}
+                    {!isPlaying && !currentlyPlayingIndex && !isLoading && !errorState && <p>Analysis results will appear here.</p>}
                 </div>
             </div>
         </div>

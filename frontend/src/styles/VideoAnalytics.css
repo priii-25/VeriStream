@@ -1,185 +1,395 @@
 /* VideoAnalytics.css */
 .video-analytics-container {
-    background-color: #000000;
-    color: #ffffff;
-    font-family: 'Roboto', sans-serif;
-    padding: 20px;
-    min-height: 100vh;
-  }
-  
-  .video-analytics-container h1,
-  .video-analytics-container h2,
-  .video-analytics-container h3,
-  .video-analytics-container h4,
-  .video-analytics-container h5 {
-    color: #ffffff;
-    margin-bottom: 15px;
-  }
-  
-  .upload-form {
-    display: flex;
-    align-items: center;
-    margin-bottom: 20px;
-  }
-  
-  .upload-form input[type="file"] {
-    padding: 10px;
-    background-color: #1a1a1a;
-    border: 1px solid #333;
-    color: #ffffff;
-    border-radius: 5px;
-    margin-right: 10px;
-  }
-  
-  .upload-form button,
-  .translate-section button,
-  .download-button {
-    padding: 10px 20px;
-    background-color: #007bff;
-    color: #ffffff;
-    border: none;
-    border-radius: 5px;
-    cursor: pointer;
-    transition: background-color 0.3s;
-  }
-  
-  .upload-form button:disabled,
-  .translate-section button:disabled {
-    background-color: #666;
-    cursor: not-allowed;
-  }
-  
-  .upload-form button:hover:not(:disabled),
-  .translate-section button:hover:not(:disabled),
-  .download-button:hover {
-    background-color: #0056b3;
-  }
-  
-  .uploaded-video video {
-    max-width: 640px;
-    height: auto;
-    border-radius: 10px;
-    box-shadow: 0 4px 8px rgba(255, 255, 255, 0.1);
-  }
-  
-  .progress-section {
-    margin-top: 20px;
-  }
-  
-  .progress-section p {
-    color: #ffffff;
-  }
-  
-  .progress-section progress {
-    width: 100%;
-    height: 20px;
-    background-color: #1a1a1a;
-    border-radius: 5px;
-  }
-  
-  .error-message {
-    color: #ff4444;
-    background-color: #1a1a1a;
-    padding: 10px;
-    border-radius: 5px;
-    margin-top: 20px;
-  }
-  
-  .results-section {
-    margin-top: 20px;
-  }
-  
-  .card {
-    background-color: #1a1a1a;
-    border-radius: 10px;
-    padding: 15px;
-    margin-bottom: 15px;
-    box-shadow: 0 4px 8px rgba(255, 255, 255, 0.1);
-  }
-  
-  .card p,
-  .card li {
-    margin: 5px 0;
-  }
-  
-  .card ul {
-    list-style-type: none;
-    padding-left: 20px;
-  }
-  
-  .card ul li::before {
-    content: "•";
-    color: #007bff;
-    display: inline-block;
-    width: 1em;
-    margin-left: -1em;
-  }
-  
-  .translate-section {
-    margin-top: 10px;
-  }
-  
-  .translate-section select {
-    padding: 8px;
-    background-color: #333;
-    color: #ffffff;
-    border: 1px solid #555;
-    border-radius: 5px;
-    margin-right: 10px;
-  }
-  
-  .highlight {
-    color: #007bff;
-  }
-  
-  .alert-high {
-    color: #ff4444;
-  }
-  
-  .alert-low {
-    color: #28a745;
-  }
-  
-  .chart-container {
-    background-color: #1a1a1a;
-    border-radius: 10px;
-    padding: 15px;
-    margin-bottom: 15px;
-    box-shadow: 0 4px 8px rgba(255, 255, 255, 0.1);
-  }
-  
-  .chart-container canvas {
-    background-color: #1a1a1a;
-  }
-  
-  .fact-check-section button {
-    background-color: #333;
-    color: #007bff;
-    border: none;
-    padding: 8px 15px;
-    border-radius: 5px;
-    cursor: pointer;
-    margin-bottom: 10px;
-    transition: background-color 0.3s;
-  }
-  
-  .fact-check-section button:hover {
-    background-color: #444;
-  }
-  
-  .fact-check-section pre {
-    background-color: #222;
-    padding: 10px;
-    border-radius: 5px;
-    white-space: pre-wrap;
-  }
-  
-  .knowledge-graph-section iframe {
-    border-radius: 10px;
-  }
-  
-  .map-container {
-    height: 400px;
-    width: 100%;
-    border-radius: 10px;
-  }
+  background-color: #000000; /* Black background */
+  color: #e0e0e0; /* Light gray text */
+  font-family: 'Roboto', sans-serif;
+  padding: 20px;
+  min-height: 100vh;
+}
+
+.video-analytics-container h1,
+.video-analytics-container h2,
+.video-analytics-container h3,
+.video-analytics-container h4,
+.video-analytics-container h5 {
+  color: #ffffff; /* White headings */
+  margin-bottom: 15px;
+  font-weight: 500;
+}
+
+.upload-form {
+  display: flex;
+  align-items: center;
+  margin-bottom: 25px;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* Style the label to look like a button */
+.file-label {
+  display: inline-block;
+  padding: 10px 20px;
+  background-color: #343a40; /* Dark gray */
+  color: #ffffff;
+  border: 1px solid #555;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background-color 0.3s;
+  font-size: 0.95em;
+  white-space: nowrap; /* Prevent text wrapping */
+  overflow: hidden;
+  text-overflow: ellipsis; /* Add ellipsis if filename is too long */
+  max-width: 300px; /* Limit max width */
+}
+.file-label:hover {
+  background-color: #495057;
+}
+
+.upload-form button,
+.translate-section button,
+.download-button {
+  padding: 10px 20px;
+  background-color: #007bff;
+  color: #ffffff;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background-color 0.3s, transform 0.1s ease;
+  font-weight: 500;
+  font-size: 0.95em;
+}
+.upload-form button:active,
+.translate-section button:active,
+.download-button:active {
+  transform: scale(0.98);
+}
+
+.upload-form button:disabled,
+.translate-section button:disabled {
+  background-color: #555;
+  cursor: not-allowed;
+  color: #aaa;
+}
+
+.upload-form button:hover:not(:disabled),
+.translate-section button:hover:not(:disabled),
+.download-button:hover {
+  background-color: #0056b3;
+}
+
+.uploaded-video video {
+  max-width: 100%; /* Responsive video */
+  width: 720px; /* Max width */
+  height: auto;
+  border-radius: 6px;
+  display: block; /* Prevent extra space */
+  margin: 0 auto; /* Center */
+  border: 1px solid #333;
+}
+
+/* --- PROGRESS BAR --- */
+.progress-section {
+  margin: 15px 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.progress-section progress {
+  flex-grow: 1; /* Take available space */
+  height: 12px; /* Slightly thicker */
+  appearance: none;
+  border: none;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.progress-section progress::-webkit-progress-bar {
+  background-color: #333; /* Dark track */
+  border-radius: 6px;
+}
+.progress-section progress::-moz-progress-bar {
+  background-color: #333;
+  border-radius: 6px;
+}
+.progress-section progress::-webkit-progress-value {
+  background-color: #28a745; /* Green fill */
+  border-radius: 6px;
+  transition: width 0.3s ease-out;
+}
+.progress-section progress::-moz-progress-bar {
+  background-color: #28a745;
+  border-radius: 6px;
+  transition: width 0.3s ease-out;
+}
+.progress-section span {
+  font-weight: bold;
+  color: #ccc;
+  min-width: 45px;
+  text-align: right;
+}
+/* --- END PROGRESS BAR --- */
+
+.error-message {
+  color: #dc3545; /* Danger color */
+  background-color: rgba(220, 53, 69, 0.1); /* Light danger bg */
+  border: 1px solid rgba(220, 53, 69, 0.3);
+  padding: 12px 15px;
+  border-radius: 5px;
+  margin: 20px 0;
+}
+
+.results-display {
+  margin-top: 30px;
+}
+
+.card {
+  background-color: #1a1a1a; /* Dark card background */
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 20px;
+  box-shadow: 0 2px 5px rgba(255, 255, 255, 0.05);
+  border: 1px solid #333; /* Subtle border */
+}
+
+.card h3 {
+  border-bottom: 1px solid #444;
+  padding-bottom: 10px;
+  margin-bottom: 20px;
+  margin-top: 0; /* Remove default top margin */
+  color: #eee; /* Lighter heading color */
+}
+
+.card p,
+.card li {
+  margin: 8px 0;
+  font-size: 0.95em;
+  line-height: 1.6;
+  color: #ccc; /* Lighter text in cards */
+}
+.card p strong {
+  color: #e0e0e0; /* Even lighter for strong tags */
+}
+
+.card ul {
+  list-style-type: none;
+  padding-left: 0; /* No indent */
+  margin-top: 10px;
+}
+
+.card ul li {
+  position: relative;
+  padding-left: 20px; /* Space for custom bullet */
+  margin-bottom: 5px;
+}
+
+.card ul li::before {
+  content: "▹"; /* Use a different bullet */
+  color: #007bff; /* Accent color */
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+.card textarea {
+  width: 100%;
+  padding: 10px;
+  background-color: #252525; /* Slightly lighter text area */
+  border: 1px solid #444;
+  color: #e0e0e0;
+  border-radius: 4px;
+  font-family: inherit; /* Use same font */
+  font-size: 0.9em;
+  resize: vertical; /* Allow vertical resize */
+  min-height: 80px; /* Minimum height */
+  margin-top: 5px;
+}
+
+.translate-section {
+  margin-top: 15px;
+  padding-top: 15px;
+  border-top: 1px solid #333; /* Separator */
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.translate-section label {
+  color: #ccc;
+  margin-right: 5px;
+}
+.translate-section select {
+  padding: 8px 10px;
+  background-color: #333;
+  color: #ffffff;
+  border: 1px solid #555;
+  border-radius: 5px;
+}
+.translated-text {
+  margin-top: 10px;
+  width: 100%;
+}
+
+.highlight {
+  color: #00bfff; /* Bright blue highlight */
+  font-weight: bold;
+}
+
+.alert {
+  font-weight: bold;
+  padding: 5px 0;
+}
+.alert-high {
+  color: #ff6b6b; /* Softer red */
+}
+.alert-low {
+  color: #28a745; /* Green */
+}
+
+.chart-container {
+  /* Background is set by .card */
+  /* padding: 15px; Remove padding if card has it */
+  position: relative; /* Needed for chart responsiveness */
+  height: 350px; /* Fixed height for chart area */
+  width: 100%;
+  margin-bottom: 15px; /* Space before download button */
+}
+
+.download-button {
+  background-color: #6c757d; /* Gray button */
+  margin-top: 10px; /* Ensure space */
+}
+.download-button:hover {
+  background-color: #5a6268;
+}
+
+.fact-check-section .toggle-button { /* Same style as RealTimeAnalysis */
+  background-color: #444;
+  color: #00bfff;
+  border: 1px solid #555;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85em;
+  margin-bottom: 10px;
+  transition: background-color 0.2s ease;
+}
+.fact-check-section .toggle-button:hover {
+  background-color: #555;
+}
+.fact-check-section .fact-check-content {
+  margin-top: 15px;
+}
+.fact-check-section .claim-detail { /* Style claims within fact check */
+  margin-bottom: 15px;
+  padding-bottom: 15px;
+  border-bottom: 1px dashed #333;
+}
+.fact-check-section .claim-detail:last-child { border-bottom: none; }
+.fact-check-section .claim-detail p { margin: 5px 0; color: #ccc; }
+.fact-check-section .claim-detail strong { color: #e0e0e0; }
+.fact-check-section .claim-detail .highlight { font-weight: bold; color: #00bfff;}
+.fact-check-section .summary-box {
+  background-color: #222;
+  padding: 15px;
+  border-radius: 5px;
+  white-space: pre-wrap; /* Wrap long lines */
+  font-family: monospace; /* Monospace for pre */
+  font-size: 0.85em;
+  color: #bbb;
+  border: 1px solid #444;
+  max-height: 300px; /* Limit height */
+  overflow-y: auto; /* Add scrollbar if needed */
+  margin-top: 15px;
+}
+
+.map-container {
+  height: 350px; /* Adjust map height */
+  width: 100%;
+  border-radius: 6px;
+  filter: grayscale(80%) brightness(80%); /* Style map */
+  margin-top: 10px;
+}
+
+/* --- SUSPICIOUS FRAMES (Alternative 1) STYLES --- */
+.suspicious-frames-card {
+  background-color: #2a2a2a; /* Slightly different dark bg */
+  border-color: #555;
+}
+.suspicious-frames-card h3 {
+  color: #ffc107; /* Warning yellow heading */
+  border-bottom: 1px solid #555;
+}
+.suspicious-frames-card > p { /* Style the intro paragraph */
+  color: #aaa;
+  font-style: italic;
+  font-size: 0.9em;
+  margin-bottom: 15px;
+}
+
+.suspicious-frames-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.suspicious-frame-item-detailed {
+  border: 1px solid #444; /* Darker border */
+  border-radius: 6px;
+  margin-bottom: 15px;
+  padding: 15px;
+  background-color: #1f1f1f; /* Card item bg */
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.frame-info {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 20px; /* Row and column gap */
+  padding-bottom: 10px;
+  border-bottom: 1px solid #333; /* Separator before button/heatmap */
+}
+
+.frame-info p {
+  margin: 0;
+  font-size: 0.9em;
+  color: #ccc;
+}
+.frame-info .highlight {
+  font-weight: bold;
+  color: #ffc107; /* Match heading */
+  font-size: 1.05em;
+}
+
+.toggle-heatmap-button {
+  background-color: #17a2b8; /* Info blue */
+  color: white;
+  border: none;
+  padding: 6px 12px; /* Slightly larger */
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85em;
+  transition: background-color 0.2s ease;
+  /* margin-left: auto; Removed - let gap handle spacing */
+}
+.toggle-heatmap-button:hover {
+  background-color: #138496;
+}
+
+.heatmap-display-area {
+  margin-top: 10px;
+  text-align: center;
+}
+
+.heatmap-image-large {
+  max-width: 90%; /* Allow slightly larger display */
+  max-height: 400px; /* Limit height */
+  height: auto;
+  border: 1px solid #555; /* Darker border */
+  border-radius: 4px;
+  margin: 0 auto;
+  display: block;
+  background-color: #000; /* Add black background in case image loads slowly */
+}
+/* --- END SUSPICIOUS FRAMES STYLES --- */

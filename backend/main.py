@@ -6,7 +6,8 @@ from fastapi.staticfiles import StaticFiles
 # --- Keep imports needed for BOTH modes ---
 from video_analyzer import VideoAnalyzer # Used by both
 from analyzer import OptimizedAnalyzer # Used by both (or parts of it)
-from optimized_deepfake_detector import OptimizedDeepfakeDetector # Used directly by stream, video_analyzer uses its own instance for upload path
+# ** Use the UPDATED detector for BOTH stream and internal video_analyzer use **
+from optimized_deepfake_detector import OptimizedDeepfakeDetector # Used directly by stream AND by video_analyzer
 from knowledge_graph import KnowledgeGraphManager # Used by Analyzer/FactChecker
 from fact_checker import FactChecker # Used by both
 import cv2
@@ -19,32 +20,32 @@ import os
 import json
 import requests
 from dotenv import load_dotenv
-from typing import Dict, Any, List
-import aiofiles # <--- Import aiofiles
-import aiofiles.os # <--- Import async os functions from aiofiles
+from typing import Dict, Any, List, Optional # Added Optional
+import aiofiles
+import aiofiles.os
 
 # --- Imports specifically for UPLOAD mode ---
-from video_processor import VideoProducer # For Kafka in upload (if Option 1 used)
-# from spark_video_processor import SparkVideoProcessor # If Spark is used for upload analysis
-# from kafka import KafkaConsumer # For consuming Spark results in upload (if Option 1 used) - Comment out if not using Spark
+# (Keep existing imports like VideoProducer)
 
 # --- Imports specifically for STREAM mode ---
 from streamlink import Streamlink
 
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# FactChecker/Analyzer should load their keys internally from .env
 
 logger = logging.getLogger(__name__)
-# Consistent logging setup
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, # Set default to INFO, DEBUG can be too verbose
     format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler('veristream_backend.log')] # Log to console and file
+    handlers=[logging.StreamHandler(), logging.FileHandler('veristream_backend.log')]
 )
+# Silence overly verbose libraries unless debugging
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING) # Added httpcore
 logging.getLogger("shap").setLevel(logging.WARNING)
-logging.getLogger("kafka").setLevel(logging.WARNING) # Quieter Kafka logs unless debugging
+logging.getLogger("kafka").setLevel(logging.WARNING)
+logging.getLogger("PIL").setLevel(logging.WARNING) # Pillow logs font warnings sometimes
+logging.getLogger("matplotlib").setLevel(logging.WARNING) # Matplotlib logs
 
 
 # Suppress Hugging Face parallelism warnings
@@ -56,7 +57,6 @@ if not os.path.exists(TEMP_DIR):
     os.makedirs(TEMP_DIR)
 
 app = FastAPI()
-# Mount the temp directory for serving files
 app.mount(f"/{TEMP_DIR}", StaticFiles(directory=TEMP_DIR), name="temp_files")
 
 app.add_middleware(
@@ -70,26 +70,25 @@ app.add_middleware(
 # --- Instantiate components used by BOTH modes ---
 logger.info("Initializing models and components...")
 try:
-    video_analyzer = VideoAnalyzer()
-    text_analyzer = OptimizedAnalyzer(use_gpu=True)
-    fact_checker = FactChecker()
+    # The single detector instance used by the stream
     stream_deepfake_detector = OptimizedDeepfakeDetector()
+    # VideoAnalyzer now uses its OWN detector instance internally, no need to pass one
+    video_analyzer = VideoAnalyzer()
+    text_analyzer = OptimizedAnalyzer(use_gpu=True) # Or False if no GPU
+    fact_checker = FactChecker()
     streamlink_session = Streamlink()
     # Instantiate Kafka producer if needed for upload Option 1
-    # Ensure Kafka is running if this is used. Handle potential connection errors.
-    try:
-        video_producer = VideoProducer()
-    except Exception as kafka_err:
-        logger.error(f"Failed to initialize Kafka Producer: {kafka_err}. Upload via Kafka will fail.")
-        video_producer = None # Set to None if unusable
-
-    # spark_processor = SparkVideoProcessor() # Uncomment if Spark processing for uploads is active
+    video_producer = None # Initialize as None
+    # try:
+    #     video_producer = VideoProducer() # Uncomment if using Kafka uploads
+    # except Exception as kafka_err:
+    #     logger.error(f"Failed to initialize Kafka Producer: {kafka_err}. Upload via Kafka will fail.")
 
     logger.info("Models and components initialized.")
 except Exception as e:
      logger.critical(f"FATAL: Failed to initialize core components: {e}", exc_info=True)
+     # Exit or raise a more specific error if core components fail
      raise RuntimeError(f"Core component initialization failed: {e}") from e
-
 
 # --- Global State for STREAM mode ---
 stream_is_running = False
@@ -98,6 +97,8 @@ stream_fact_check_buffer = ""
 STREAM_FACT_CHECK_BUFFER_DURATION = 30
 stream_last_fact_check_time = 0
 stream_active_tasks = set()
+# Define heatmap threshold for stream mode
+STREAM_HEATMAP_THRESHOLD = 0.7
 
 # --- Global State for UPLOAD mode ---
 upload_progress_clients = []
@@ -109,9 +110,10 @@ async def stream_download_chunk(stream_url: str, output_path: str, duration: int
     """Downloads AND RE-ENCODES a stream chunk using FFmpeg."""
     task_id = asyncio.current_task().get_name() if asyncio.current_task() else 'download'
     logger.info(f"[{task_id}] Starting download & re-encode: {os.path.basename(output_path)} for {duration}s")
+    # Reduced CRF for potentially better quality if needed, but slower
     cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-i", stream_url, "-t", str(duration),
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p", # Adjusted preset/crf
         "-c:a", "aac", "-b:a", "128k", "-f", "mp4", output_path, "-y" ]
     process = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE )
@@ -121,25 +123,25 @@ async def stream_download_chunk(stream_url: str, output_path: str, duration: int
         return False
     else:
         # Use aiofiles for file system checks
-        if await aiofiles.os.path.exists(output_path):
-            try:
+        try:
+            if await aiofiles.os.path.exists(output_path):
                 stat_result = await aiofiles.os.stat(output_path)
                 if stat_result.st_size > 1000: # Check > 1KB approx
                      logger.info(f"[{task_id}] Finished download (re-encoded): {os.path.basename(output_path)}")
                      return True
                 else:
                      logger.error(f"[{task_id}] FFmpeg finished but output file {os.path.basename(output_path)} is too small.")
-                     await aiofiles.os.remove(output_path)
+                     await aiofiles.os.remove(output_path) # Clean up tiny file
                      return False
-            except Exception as stat_err:
-                 logger.error(f"[{task_id}] Error checking size of {os.path.basename(output_path)}: {stat_err}")
-                 return False
-        else:
-             logger.error(f"[{task_id}] FFmpeg finished but output file {os.path.basename(output_path)} is missing.")
+            else:
+                logger.error(f"[{task_id}] FFmpeg finished but output file {os.path.basename(output_path)} is missing.")
+                return False
+        except Exception as file_err:
+             logger.error(f"[{task_id}] Error checking/removing output file {os.path.basename(output_path)}: {file_err}")
              return False
 
 async def stream_analyze_chunk(chunk_path: str, chunk_index: int) -> Dict[str, Any] | None:
-    """Analyzes a single 10-second video chunk (stream mode)."""
+    """Analyzes a single video chunk (stream mode), generating heatmap if score is high."""
     task_id = asyncio.current_task().get_name() if asyncio.current_task() else f'analyze-{chunk_index}'
     if not await aiofiles.os.path.exists(chunk_path):
         logger.warning(f"[{task_id}] Chunk file not found: {chunk_path}")
@@ -147,67 +149,132 @@ async def stream_analyze_chunk(chunk_path: str, chunk_index: int) -> Dict[str, A
 
     logger.info(f"[{task_id}] Analyzing chunk: {os.path.basename(chunk_path)}")
     analysis_start_time = time.time()
-    analysis_data = {}
-    analysis_frame = None
+    analysis_data = {
+        "deepfake_analysis": {"timestamp": -1.0, "score": 0.0, "heatmap_url": None}, # Initialize heatmap_url
+        "transcription": {"original": "[Analysis Pending]", "detected_language": "unknown", "english": ""}
+    }
+    analysis_frame = None # The single frame chosen for analysis
     actual_frame_time = -1.0
     cap = None
     audio_path = os.path.join(TEMP_DIR, f"stream_audio_{chunk_index}.wav")
+    overlay_path_abs = None # Store absolute path for cleanup if generated
+    base_chunk_filename = os.path.basename(chunk_path).split('.')[0] # e.g., stream_chunk_123
 
     try:
-        # Video Analysis
+        # --- Video Analysis ---
         cap = cv2.VideoCapture(chunk_path)
         if not cap.isOpened(): raise ValueError(f"Failed to open chunk {os.path.basename(chunk_path)}")
+
+        # Target the middle frame (e.g., 5 seconds into a 10-second chunk)
         target_frame_time_ms = 5 * 1000
+        frame_read_count = 0
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30 # Default FPS if not available
+        target_frame_index = int(fps * 5) # Approx frame index for 5 seconds
+
         while True:
             ret, frame = cap.read()
             if not ret: break
             current_time_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            if current_time_ms > 1000:
-                if analysis_frame is None and current_time_ms >= target_frame_time_ms:
-                    analysis_frame = frame.copy(); actual_frame_time = current_time_ms / 1000.0
-                    logger.debug(f"[{task_id}] Selected frame at ~{actual_frame_time:.2f}s")
-                    break
-        cap.release()
+            # Select the frame closest to the target time
+            if analysis_frame is None and frame_read_count >= target_frame_index:
+                if frame is not None and frame.size > 0:
+                    analysis_frame = frame.copy()
+                    actual_frame_time = current_time_ms / 1000.0
+                    logger.debug(f"[{task_id}] Selected frame at index {frame_read_count} (~{actual_frame_time:.2f}s)")
+                    break # Found our frame
+                else:
+                    logger.warning(f"[{task_id}] Invalid frame near target index {target_frame_index}, continuing search...")
+            frame_read_count += 1
+        # Ensure cap is released even if loop breaks early
+        if cap.isOpened(): cap.release()
 
+        # --- Deepfake Detection & Heatmap Generation ---
         deepfake_score = 0.0
+        heatmap_url = None
         if analysis_frame is not None:
             try:
-                resized_frame = cv2.resize(analysis_frame, (640, 480))
-                scores = await asyncio.to_thread(stream_deepfake_detector.predict_batch, [resized_frame])
+                # Use predict_batch (even for single frame, keeps API consistent)
+                # Expects list of frames
+                scores = await asyncio.to_thread(stream_deepfake_detector.predict_batch, [analysis_frame])
                 deepfake_score = scores[0] if scores else 0.0
-                analysis_data["deepfake_analysis"] = {"timestamp": actual_frame_time, "score": deepfake_score}
                 logger.debug(f"[{task_id}] Deepfake score: {deepfake_score:.3f}")
-            except Exception as df_err:
-                 logger.error(f"[{task_id}] Deepfake prediction failed: {df_err}")
-                 analysis_data["deepfake_analysis"] = {"timestamp": actual_frame_time, "score": -1.0}
-        else:
-            logger.warning(f"[{task_id}] No frame found for deepfake in {os.path.basename(chunk_path)}")
-            analysis_data["deepfake_analysis"] = {"timestamp": -1.0, "score": 0.0}
 
-        # Audio Analysis
+                # Generate heatmap ONLY if score is high
+                if deepfake_score > STREAM_HEATMAP_THRESHOLD:
+                    logger.info(f"[{task_id}] Score {deepfake_score:.3f} > {STREAM_HEATMAP_THRESHOLD}, generating heatmap...")
+                    # These are blocking calls, run in thread
+                    heatmap = await asyncio.to_thread(stream_deepfake_detector.get_attention_maps, analysis_frame)
+                    if heatmap is not None:
+                        overlay = await asyncio.to_thread(stream_deepfake_detector.create_overlay, analysis_frame, heatmap)
+                        if overlay is not None:
+                            overlay_filename = f"{base_chunk_filename}_overlay.jpg"
+                            overlay_path_abs = os.path.join(TEMP_DIR, overlay_filename)
+                            # Save using OpenCV in the thread
+                            def save_overlay():
+                                try:
+                                    success = cv2.imwrite(overlay_path_abs, overlay)
+                                    if success:
+                                         logger.info(f"[{task_id}] Saved heatmap overlay: {overlay_filename}")
+                                         return f"/{TEMP_DIR}/{overlay_filename}"
+                                    else:
+                                         logger.error(f"[{task_id}] Failed to save overlay image {overlay_filename} using cv2.imwrite.")
+                                         return None
+                                except Exception as save_e:
+                                     logger.error(f"[{task_id}] Error saving overlay {overlay_filename}: {save_e}")
+                                     return None
+                            heatmap_url = await asyncio.to_thread(save_overlay)
+                        else: logger.warning(f"[{task_id}] Overlay creation failed.")
+                    else: logger.warning(f"[{task_id}] Heatmap generation failed.")
+
+            except Exception as df_err:
+                 logger.error(f"[{task_id}] Deepfake prediction/heatmap failed: {df_err}", exc_info=True)
+                 deepfake_score = -1.0 # Indicate error
+
+            analysis_data["deepfake_analysis"] = {
+                "timestamp": actual_frame_time,
+                "score": deepfake_score,
+                "heatmap_url": heatmap_url # Include URL (or None)
+            }
+        else:
+            logger.warning(f"[{task_id}] No suitable frame found for deepfake analysis in {os.path.basename(chunk_path)}")
+            analysis_data["deepfake_analysis"] = {"timestamp": -1.0, "score": 0.0, "heatmap_url": None}
+
+        # --- Audio Analysis ---
+        # (Audio extraction and transcription logic remains largely the same)
         transcription_data = { "original": "[Audio Fail]", "detected_language": "unknown", "english": "" }
-        cmd_audio = [ "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", chunk_path, "-ss", "1", "-t", "9",
+        cmd_audio = [ "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", chunk_path,
                       "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path, "-y" ]
+        # Consider adding -ss and -t if analyzing only a part of the audio chunk makes sense
+        # e.g., -ss 1 -t 8 to skip first sec, take next 8s
         audio_proc = await asyncio.create_subprocess_exec(*cmd_audio, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         _, audio_stderr = await audio_proc.communicate()
 
-        if audio_proc.returncode == 0 and await aiofiles.os.path.exists(audio_path):
-             stat_res = await aiofiles.os.stat(audio_path)
-             if stat_res.st_size > 44:
+        if audio_proc.returncode == 0:
+            if await aiofiles.os.path.exists(audio_path):
                 try:
-                    logger.debug(f"[{task_id}] Transcribing audio chunk {chunk_index}")
-                    trans_result = await asyncio.to_thread(video_analyzer.whisper_model.transcribe, audio_path, fp16=False) # Use base model instance
-                    original_text = trans_result["text"].strip(); detected_lang = trans_result["language"]
-                    english_text = await translate_to_english(original_text, detected_lang)
-                    transcription_data = {"original": original_text, "detected_language": detected_lang, "english": english_text}
-                    logger.debug(f"[{task_id}] Transcription done: Lang={detected_lang}, Text={original_text[:30]}...")
-                except Exception as whisper_err:
-                     logger.error(f"[{task_id}] Whisper failed: {whisper_err}")
-                     transcription_data["original"] = "[Transcription Error]"
-             else:
-                  logger.warning(f"[{task_id}] Audio file empty {os.path.basename(audio_path)}")
-                  transcription_data["original"] = "[No Audio Data]"
-                  await aiofiles.os.remove(audio_path)
+                    stat_res = await aiofiles.os.stat(audio_path)
+                    if stat_res.st_size > 44: # Check if file has more than just WAV header
+                        logger.debug(f"[{task_id}] Transcribing audio chunk {chunk_index}")
+                        # Run Whisper transcription in a separate thread
+                        trans_result = await asyncio.to_thread(video_analyzer.whisper_model.transcribe, audio_path, fp16=False)
+                        original_text = trans_result["text"].strip()
+                        detected_lang = trans_result["language"]
+                        # Translate if necessary (also in thread)
+                        english_text = await translate_to_english(original_text, detected_lang) # Assuming translate_to_english handles threading
+                        transcription_data = {"original": original_text, "detected_language": detected_lang, "english": english_text}
+                        logger.debug(f"[{task_id}] Transcription done: Lang={detected_lang}, Text={original_text[:30]}...")
+                    else:
+                        logger.warning(f"[{task_id}] Audio file exists but is empty: {os.path.basename(audio_path)}")
+                        transcription_data["original"] = "[No Audio Data]"
+                        # Clean up empty file
+                        await aiofiles.os.remove(audio_path)
+                except Exception as audio_err:
+                    logger.error(f"[{task_id}] Audio processing/transcription failed: {audio_err}", exc_info=True)
+                    transcription_data["original"] = "[Transcription Error]"
+            else:
+                # FFmpeg succeeded but file is missing? Should be rare.
+                logger.error(f"[{task_id}] Audio extract ffmpeg OK, but file missing: {os.path.basename(audio_path)}")
+                transcription_data["original"] = "[Audio File Missing]"
         else:
             logger.warning(f"[{task_id}] Audio extract failed (Code: {audio_proc.returncode}) {os.path.basename(chunk_path)}. Stderr: {audio_stderr.decode()}")
             transcription_data["original"] = "[Audio Extraction Error]"
@@ -215,19 +282,28 @@ async def stream_analyze_chunk(chunk_path: str, chunk_index: int) -> Dict[str, A
         analysis_data["transcription"] = transcription_data
 
     except Exception as e:
-         logger.error(f"[{task_id}] Error in chunk analysis {chunk_path}: {e}", exc_info=True)
-         return None
+         logger.error(f"[{task_id}] Error during chunk analysis {chunk_path}: {e}", exc_info=True)
+         # Ensure basic structure is returned on error
+         analysis_data["deepfake_analysis"] = {"timestamp": -1.0, "score": -1.0, "heatmap_url": None}
+         analysis_data["transcription"] = {"original": "[Analysis Failed]", "detected_language": "error", "english": ""}
+         # Return None maybe? Or the error structure? Returning the structure seems better.
+         # return None
     finally:
-        if cap and cap.isOpened(): cap.release()
+        # Release video capture if still open
+        if cap and cap.isOpened():
+            cap.release()
+        # Clean up temporary audio file
         if await aiofiles.os.path.exists(audio_path):
             try: await aiofiles.os.remove(audio_path)
             except Exception as e_del: logger.warning(f"[{task_id}] Could not remove temp audio {audio_path}: {e_del}")
+        # NOTE: Don't delete overlay here, it needs to be served. Cleanup happens later.
 
     logger.info(f"[{task_id}] Chunk {chunk_index} analysis finished in {time.time() - analysis_start_time:.2f}s")
     return analysis_data
 
 
 async def stream_processing_manager(stream_url_platform: str):
+    # (No changes needed in the manager itself)
     global stream_is_running, stream_active_tasks
     logger.info(f"MANAGER: Starting stream for {stream_url_platform}")
     stream_direct_url = None; processing_task = None
@@ -238,299 +314,694 @@ async def stream_processing_manager(stream_url_platform: str):
         else: raise ValueError("No suitable stream found.")
         processing_task = asyncio.create_task(stream_processing_loop(stream_direct_url), name="stream_processing_loop")
         stream_active_tasks.add(processing_task)
-        await processing_task
+        await processing_task # Wait for the loop to finish or raise exception
+    except asyncio.CancelledError:
+         logger.info("MANAGER: Task was cancelled.")
     except Exception as e: logger.error(f"MANAGER: Error: {e}", exc_info=True)
     finally:
         logger.info("MANAGER: Stream processing finishing.")
         if processing_task in stream_active_tasks: stream_active_tasks.remove(processing_task)
-        if stream_is_running: logger.warning("MANAGER: Loop exited, stopping stream."); stream_is_running = False
+        # Ensure stream_is_running is set to False if the loop exits unexpectedly
+        if stream_is_running:
+            logger.warning("MANAGER: Loop exited unexpectedly, ensuring stream state is stopped.")
+            stream_is_running = False
 
 
 async def stream_processing_loop(stream_direct_url: str):
+    # (Needs modification for cleanup)
     global stream_is_running, stream_active_tasks
-    initial_buffer_duration = 10
-    logger.info(f"LOOP: Waiting {initial_buffer_duration}s...")
-    try: await asyncio.sleep(initial_buffer_duration)
-    except asyncio.CancelledError: logger.info("LOOP: Initial sleep cancelled."); return
+    initial_buffer_duration = 5 # Reduced initial buffer wait
+    chunk_duration = 10
+    playback_delay = chunk_duration * 2 # Adjust playback delay (e.g., 2 chunks behind)
+    cycle_target_time = chunk_duration # Target one cycle per chunk duration
 
-    chunk_duration = 10; playback_delay = 30; cycle_target_time = chunk_duration
-    current_chunk_path_for_analysis = None; next_chunk_path_downloaded = None
-    download_task = None; analysis_task = None
-    chunk_index = 0; results_buffer = []
-    stream_start_time = time.time(); last_successful_download_time = time.time()
+    logger.info(f"LOOP: Waiting {initial_buffer_duration}s for initial stream buffer...")
+    try:
+        await asyncio.sleep(initial_buffer_duration)
+    except asyncio.CancelledError:
+        logger.info("LOOP: Initial sleep cancelled."); return
 
-    logger.info("LOOP: Starting main cycle.")
+    current_chunk_path_for_analysis = None
+    next_chunk_path_downloaded = None
+    download_task = None
+    analysis_task = None
+    chunk_index = 0
+    results_buffer = [] # Buffer for results ready to be released
+    stream_start_time = time.time()
+    last_successful_download_time = time.time()
+    max_consecutive_failures = 3 # Stop after N download/analysis failures
+    consecutive_failures = 0
+
+    logger.info("LOOP: Starting main processing cycle.")
     while stream_is_running:
-        cycle_start_time = time.time(); chunk_index += 1
+        cycle_start_time = time.time()
+        chunk_index += 1
         loop_chunk_output_path = os.path.join(TEMP_DIR, f"stream_chunk_{chunk_index}.mp4")
-        logger.debug(f"LOOP: Cycle {chunk_index}.")
+        logger.debug(f"LOOP: Cycle {chunk_index} starting.")
 
         # --- 1. Start Download N+1 ---
         if not stream_is_running: break
-        download_task = asyncio.create_task( stream_download_chunk(stream_direct_url, loop_chunk_output_path, chunk_duration), name=f"download-{chunk_index}" )
+        # Ensure previous download task is handled if somehow still running (shouldn't happen often)
+        if download_task and not download_task.done():
+            logger.warning(f"LOOP: Previous download task {download_task.get_name()} still running? Cancelling.")
+            download_task.cancel()
+            # Allow cancellation to propagate
+            await asyncio.sleep(0.1)
+            if download_task in stream_active_tasks: stream_active_tasks.remove(download_task)
+
+        download_task = asyncio.create_task(
+            stream_download_chunk(stream_direct_url, loop_chunk_output_path, chunk_duration),
+            name=f"download-{chunk_index}"
+        )
         stream_active_tasks.add(download_task)
 
         # --- 2. Schedule Analysis N ---
         if current_chunk_path_for_analysis and stream_is_running:
-            logger.debug(f"LOOP: Scheduling analysis chunk {chunk_index - 1}")
+            logger.debug(f"LOOP: Scheduling analysis for previous chunk {chunk_index - 1}")
+            # Ensure previous analysis task is handled
             if analysis_task and not analysis_task.done():
-                 logger.warning(f"LOOP: Prev analysis {analysis_task.get_name()} unfinished, cancelling."); analysis_task.cancel()
+                 logger.warning(f"LOOP: Previous analysis {analysis_task.get_name()} unfinished, cancelling.");
+                 analysis_task.cancel()
+                 await asyncio.sleep(0.1) # Allow cancellation
                  if analysis_task in stream_active_tasks: stream_active_tasks.remove(analysis_task)
-            analysis_task = asyncio.create_task( stream_analyze_chunk(current_chunk_path_for_analysis, chunk_index - 1), name=f"analyze-{chunk_index-1}" )
+
+            analysis_task = asyncio.create_task(
+                 stream_analyze_chunk(current_chunk_path_for_analysis, chunk_index - 1),
+                 name=f"analyze-{chunk_index-1}"
+             )
             stream_active_tasks.add(analysis_task)
-            analysis_task.add_done_callback(lambda task: handle_analysis_completion(task, results_buffer))
+            # Add callback to handle result when done (and potential errors)
+            analysis_task.add_done_callback(
+                lambda task: handle_analysis_completion(task, results_buffer)
+            )
 
         # --- 3. Wait for Download N+1 ---
-        download_success = False; next_chunk_path_downloaded = None
+        download_success = False
+        next_chunk_path_downloaded = None
         if download_task:
             try:
+                # Wait slightly longer than target time for download flexibility
                 wait_start = time.time()
-                while time.time() - wait_start < cycle_target_time * 2.5:
-                    if not stream_is_running: raise asyncio.CancelledError("Stream stopped")
-                    if download_task.done(): break
-                    await asyncio.sleep(0.1)
-                if not download_task.done(): download_task.cancel(); await asyncio.sleep(0.1); raise asyncio.TimeoutError(f"Dl timeout {chunk_index}")
-                download_success = await download_task
-                if download_success: next_chunk_path_downloaded = loop_chunk_output_path; last_successful_download_time = time.time()
-                else: raise RuntimeError(f"Dl failed {chunk_index}")
-            except (asyncio.CancelledError, asyncio.TimeoutError, RuntimeError) as e:
-                logger.error(f"LOOP: Download {download_task.get_name()} failed/stopped: {type(e).__name__} - {e}. Stopping."); stream_is_running = False; break
-            except Exception as e: logger.error(f"LOOP: Error await dl {download_task.get_name()}: {e}", exc_info=True); stream_is_running = False; break
-            finally:
-                 if download_task in stream_active_tasks: stream_active_tasks.remove(download_task)
+                timeout_duration = cycle_target_time * 2.5 # Allow 2.5x chunk duration for download
+                logger.debug(f"LOOP: Waiting for download {download_task.get_name()} (timeout: {timeout_duration:.1f}s)")
+                # await asyncio.wait_for(download_task, timeout=timeout_duration) # Use wait_for for clean timeout
+                # Alternative manual wait loop to check stream_is_running more often
+                while time.time() - wait_start < timeout_duration:
+                     if not stream_is_running: raise asyncio.CancelledError("Stream stopped during download wait")
+                     if download_task.done(): break
+                     await asyncio.sleep(0.1)
 
-        # --- 4. Release Results ---
-        try: await release_buffered_results(results_buffer, stream_start_time, playback_delay, chunk_duration)
-        except Exception as e: logger.error(f"LOOP: Error releasing results: {e}")
+                if not download_task.done():
+                     # Task didn't finish in time
+                     download_task.cancel()
+                     await asyncio.sleep(0.1) # Allow cancellation
+                     raise asyncio.TimeoutError(f"Download task {download_task.get_name()} timed out after {timeout_duration:.1f}s")
+
+                # Get result if task finished successfully
+                download_success = download_task.result() # Will re-raise exception if task failed
+
+                if download_success:
+                    next_chunk_path_downloaded = loop_chunk_output_path
+                    last_successful_download_time = time.time()
+                    consecutive_failures = 0 # Reset failure count on success
+                    logger.debug(f"LOOP: Download {download_task.get_name()} successful.")
+                else:
+                    # Task finished but reported failure
+                    raise RuntimeError(f"Download task {download_task.get_name()} reported failure.")
+
+            except (asyncio.CancelledError, asyncio.TimeoutError, RuntimeError) as e:
+                logger.error(f"LOOP: Download {download_task.get_name()} failed or stopped: {type(e).__name__} - {e}. Stopping stream.")
+                stream_is_running = False
+                consecutive_failures += 1
+                # Don't break immediately, allow potential analysis of previous chunk to finish?
+                # Or break now? Let's break to stop faster.
+                break
+            except Exception as e:
+                # Catch unexpected errors during await/result
+                logger.error(f"LOOP: Unexpected error awaiting download {download_task.get_name()}: {e}", exc_info=True)
+                stream_is_running = False
+                consecutive_failures += 1
+                break
+            finally:
+                 # Always remove task from active set
+                 if download_task in stream_active_tasks:
+                     stream_active_tasks.remove(download_task)
+
+        # --- 4. Release Ready Results ---
+        try:
+            # Release results based on playback time + delay
+            await release_buffered_results(results_buffer, stream_start_time, playback_delay, chunk_duration)
+        except Exception as e:
+            logger.error(f"LOOP: Error releasing results: {e}")
 
         # --- 5. Prep Next Cycle & Cleanup ---
+        # Set the chunk path for the *next* iteration's analysis task
         current_chunk_path_for_analysis = next_chunk_path_downloaded
-        chunk_to_delete_index = chunk_index - 6 # Keep more chunks
-        if chunk_to_delete_index > 0:
-             path_to_delete = os.path.join(TEMP_DIR, f"stream_chunk_{chunk_to_delete_index}.mp4")
-             if await aiofiles.os.path.exists(path_to_delete):
-                 try: await aiofiles.os.remove(path_to_delete); logger.debug(f"LOOP: Deleted {os.path.basename(path_to_delete)}")
-                 except Exception as e_del: logger.warning(f"LOOP: Failed delete {path_to_delete}: {e_del}")
 
-        # --- 6. Timing ---
+        # Delete old chunk file AND its potential overlay file
+        chunk_to_delete_index = chunk_index - 4 # Keep N-1, N, N+1, N+2 (4 chunks total including download)
+        if chunk_to_delete_index > 0:
+             base_path_to_delete = os.path.join(TEMP_DIR, f"stream_chunk_{chunk_to_delete_index}")
+             path_to_delete_mp4 = f"{base_path_to_delete}.mp4"
+             path_to_delete_overlay = f"{base_path_to_delete}_overlay.jpg"
+
+             # Delete MP4
+             if await aiofiles.os.path.exists(path_to_delete_mp4):
+                 try:
+                     await aiofiles.os.remove(path_to_delete_mp4)
+                     logger.debug(f"LOOP: Deleted old chunk {os.path.basename(path_to_delete_mp4)}")
+                 except Exception as e_del:
+                     logger.warning(f"LOOP: Failed to delete old chunk {path_to_delete_mp4}: {e_del}")
+
+             # Delete Overlay (if it exists)
+             if await aiofiles.os.path.exists(path_to_delete_overlay):
+                 try:
+                     await aiofiles.os.remove(path_to_delete_overlay)
+                     logger.debug(f"LOOP: Deleted old overlay {os.path.basename(path_to_delete_overlay)}")
+                 except Exception as e_del:
+                     logger.warning(f"LOOP: Failed to delete old overlay {path_to_delete_overlay}: {e_del}")
+
+
+        # --- 6. Timing & Health Check ---
         cycle_duration = time.time() - cycle_start_time
         sleep_time = max(0, cycle_target_time - cycle_duration)
-        if cycle_duration > cycle_target_time: logger.warning(f"LOOP: Cycle {chunk_index} took {cycle_duration:.2f}s.")
-        if time.time() - last_successful_download_time > cycle_target_time * 4: # Increased tolerance
-             logger.error("LOOP: No success download recently. Stopping."); stream_is_running = False; break
-        try: await asyncio.sleep(sleep_time * 0.5) # Shorter sleep if behind
-        except asyncio.CancelledError: logger.info("LOOP: Sleep cancelled."); break
 
-    logger.info("LOOP: Exiting.")
-    if analysis_task and not analysis_task.done(): logger.info(f"LOOP: Cancelling task {analysis_task.get_name()}"); analysis_task.cancel()
+        if cycle_duration > cycle_target_time * 1.1: # Log if significantly over time
+            logger.warning(f"LOOP: Cycle {chunk_index} duration ({cycle_duration:.2f}s) exceeded target ({cycle_target_time:.1f}s).")
+            sleep_time = 0 # Don't sleep if already behind
+
+        # Check if downloads have been failing for too long
+        if time.time() - last_successful_download_time > cycle_target_time * 4: # Increased tolerance (4 chunks missed)
+             logger.error("LOOP: No successful download in a while. Stopping stream.")
+             stream_is_running = False; break
+        if consecutive_failures >= max_consecutive_failures:
+             logger.error(f"LOOP: Stopping stream after {consecutive_failures} consecutive failures.")
+             stream_is_running = False; break
+
+        # Sleep for the remaining cycle time (if any)
+        if sleep_time > 0:
+            try:
+                await asyncio.sleep(sleep_time)
+            except asyncio.CancelledError:
+                logger.info("LOOP: Cycle sleep cancelled."); break # Exit loop cleanly if cancelled
+
+    logger.info("LOOP: Exiting main processing loop.")
+    # --- Final Cleanup Attempt ---
+    # Cancel any remaining analysis task on exit
+    if analysis_task and not analysis_task.done():
+        logger.info(f"LOOP: Cancelling final analysis task {analysis_task.get_name()} on exit.")
+        analysis_task.cancel()
+        # Optionally wait briefly for cancellation
+        try:
+             await asyncio.wait_for(analysis_task, timeout=1.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+             pass # Ignore timeout/cancel on final cleanup
+        except Exception as e:
+             logger.warning(f"LOOP: Error during final analysis task cancellation: {e}")
+        finally:
+            if analysis_task in stream_active_tasks: stream_active_tasks.remove(analysis_task)
+    # Download task should have been handled within the loop
 
 
 def handle_analysis_completion(task: asyncio.Task, results_buffer: List):
+    # (No changes needed here, it just passes the result dict which now might contain heatmap_url)
     global stream_fact_check_buffer, stream_last_fact_check_time, fact_checker, stream_active_tasks
-    analysis_results_dict = None; chunk_index = -1
+    analysis_results_dict = None
+    chunk_index = -1
+    task_name = task.get_name()
+
     try:
-        chunk_index = int(task.get_name().split('-')[-1])
-        if task.cancelled(): logger.warning(f"ANALYSIS_CB: Task {task.get_name()} cancelled."); return
-        if task.exception(): logger.error(f"ANALYSIS_CB: Task {task.get_name()} failed: {task.exception()}", exc_info=task.exception()); return
+        # Extract chunk index from task name (e.g., "analyze-123")
+        try: chunk_index = int(task_name.split('-')[-1])
+        except (IndexError, ValueError): logger.error(f"ANALYSIS_CB: Could not parse chunk index from task name '{task_name}'"); return
+
+        if task.cancelled():
+            logger.warning(f"ANALYSIS_CB: Task {task_name} was cancelled."); return
+
+        # Check for exceptions during analysis
+        exc = task.exception()
+        if exc:
+            logger.error(f"ANALYSIS_CB: Task {task_name} failed with exception: {exc}", exc_info=exc)
+            # Optionally add an error marker to results buffer?
+            # results_buffer.append({"chunk_index": chunk_index, "error": str(exc)}) # Example error marker
+            return
+
+        # Get the result dictionary from the task
         analysis_results_dict = task.result()
+
         if analysis_results_dict:
-            logger.info(f"ANALYSIS_CB: Processing result chunk {chunk_index}")
-            transcription = analysis_results_dict.get("transcription", {}).get("english")
-            if transcription: stream_fact_check_buffer += " " + transcription
-            final_result = { "video_chunk_url": f"/{TEMP_DIR}/stream_chunk_{chunk_index}.mp4",
-                "chunk_index": chunk_index, "analysis_timestamp": time.time(),
-                "deepfake_analysis": analysis_results_dict.get("deepfake_analysis"),
+            logger.info(f"ANALYSIS_CB: Processing analysis result for chunk {chunk_index}")
+            # Extract transcription for fact-checking buffer
+            transcription = analysis_results_dict.get("transcription", {}).get("english", "").strip()
+            if transcription and transcription != "[Analysis Pending]" and not transcription.startswith("["): # Avoid adding error messages
+                stream_fact_check_buffer += " " + transcription
+
+            # Construct the final result object to be sent/buffered
+            final_result = {
+                "video_chunk_url": f"/{TEMP_DIR}/stream_chunk_{chunk_index}.mp4",
+                "chunk_index": chunk_index,
+                "analysis_timestamp": time.time(), # Timestamp when analysis finished processing
+                "deepfake_analysis": analysis_results_dict.get("deepfake_analysis"), # Includes score & heatmap_url
                 "transcription": analysis_results_dict.get("transcription"),
-                "fact_check_results": [], "fact_check_context_current": False }
-            # Periodic Fact-Checking (Sync call)
+                "fact_check_results": [],
+                "fact_check_context_current": False
+            }
+
+            # Periodic Fact-Checking (Synchronous call within the callback)
             current_time = time.time()
-            run_fc = (current_time - stream_last_fact_check_time >= STREAM_FACT_CHECK_BUFFER_DURATION and stream_fact_check_buffer.strip())
-            if run_fc:
-                logger.info(f"ANALYSIS_CB: Running fact check (buffer {len(stream_fact_check_buffer)})...")
-                buffer_copy = stream_fact_check_buffer; stream_fact_check_buffer = ""; stream_last_fact_check_time = current_time
+            run_fact_check = (
+                stream_fact_check_buffer.strip() and
+                (current_time - stream_last_fact_check_time >= STREAM_FACT_CHECK_BUFFER_DURATION)
+            )
+
+            if run_fact_check:
+                logger.info(f"ANALYSIS_CB: Running fact check on buffered text (length {len(stream_fact_check_buffer)})...")
+                # Copy buffer and reset global state immediately
+                buffer_to_check = stream_fact_check_buffer.strip()
+                stream_fact_check_buffer = ""
+                stream_last_fact_check_time = current_time
+
                 try:
-                     fc_result = fact_checker.check(buffer_copy.strip(), num_workers=2) # Blocking
-                     final_result["fact_check_results"] = fc_result.get("processed_claims", [])
-                     final_result["fact_check_context_current"] = True
-                     logger.info(f"ANALYSIS_CB: Fact check done. Claims: {len(final_result['fact_check_results'])}.")
-                except Exception as fc_e: logger.error(f"ANALYSIS_CB: Fact check failed: {fc_e}", exc_info=True); final_result["fact_check_results"] = [{"error": str(fc_e)}]; final_result["fact_check_context_current"] = True
-            # Insert sorted
-            ins_idx = next((i for i, r in enumerate(results_buffer) if r["chunk_index"] > chunk_index), -1)
-            if ins_idx != -1: results_buffer.insert(ins_idx, final_result)
-            else: results_buffer.append(final_result)
-            logger.debug(f"ANALYSIS_CB: Added chunk {chunk_index}. Buffer size: {len(results_buffer)}")
-        else: logger.warning(f"ANALYSIS_CB: Task {task.get_name()} returned None.")
-    except Exception as cb_err: logger.error(f"ANALYSIS_CB: Error task {task.get_name()}: {cb_err}", exc_info=True)
+                     # Run fact-checking (this is blocking)
+                     # Consider if this should be run in a separate thread if it becomes a bottleneck
+                     fc_result = fact_checker.check(buffer_to_check, num_workers=2) # Use fact_checker instance
+                     processed_claims = fc_result.get("processed_claims", [])
+                     final_result["fact_check_results"] = processed_claims
+                     final_result["fact_check_context_current"] = True # Mark this result contains current FC data
+                     logger.info(f"ANALYSIS_CB: Fact check completed. Found {len(processed_claims)} claims.")
+                except Exception as fc_e:
+                     logger.error(f"ANALYSIS_CB: Fact check execution failed: {fc_e}", exc_info=True)
+                     final_result["fact_check_results"] = [{"error": f"Fact Check Failed: {fc_e}"}]
+                     final_result["fact_check_context_current"] = True # Still mark as current context attempt
+
+            # Insert the result into the buffer, maintaining sorted order by chunk_index
+            # This ensures results are released chronologically even if analysis finishes out of order
+            ins_idx = 0
+            while ins_idx < len(results_buffer) and results_buffer[ins_idx]["chunk_index"] < chunk_index:
+                ins_idx += 1
+            results_buffer.insert(ins_idx, final_result)
+
+            logger.debug(f"ANALYSIS_CB: Added chunk {chunk_index} result. Buffer size: {len(results_buffer)}")
+        else:
+            # Handle case where analysis task returned None (should be rare if errors are handled)
+            logger.warning(f"ANALYSIS_CB: Analysis task {task_name} returned None result.")
+
+    except Exception as cb_err:
+        logger.error(f"ANALYSIS_CB: Error in callback for task {task_name}: {cb_err}", exc_info=True)
     finally:
-        if task in stream_active_tasks: stream_active_tasks.remove(task)
+        # Ensure task is removed from the active set regardless of outcome
+        if task in stream_active_tasks:
+            stream_active_tasks.remove(task)
 
 
 async def release_buffered_results(results_buffer: List, stream_start_time: float, playback_delay: int, chunk_duration: int):
+    # (No changes needed here)
     global stream_result_queue
     if not results_buffer: return
-    elapsed_time = time.time() - stream_start_time
-    ready_chunk_index = int(max(0, elapsed_time - playback_delay) / chunk_duration) + 1
-    while results_buffer and results_buffer[0]["chunk_index"] <= ready_chunk_index:
-        result = results_buffer.pop(0)
-        try:
-            await asyncio.wait_for(stream_result_queue.put(result), timeout=2.0)
-            logger.info(f"RELEASE: Sent chunk {result['chunk_index']} (QSize: {stream_result_queue.qsize()})")
-        except asyncio.TimeoutError: logger.error(f"RELEASE: Timeout put chunk {result['chunk_index']}. Re-inserting."); results_buffer.insert(0, result); break
-        except Exception as e: logger.error(f"RELEASE: Failed put chunk {result['chunk_index']}: {e}"); results_buffer.insert(0, result); break
 
+    # Calculate the index of the chunk that *should* be playing now
+    elapsed_time = time.time() - stream_start_time
+    # The chunk index that is ready to be released (finished playback_delay ago)
+    ready_chunk_index_threshold = int(max(0, elapsed_time - playback_delay) / chunk_duration)
+
+    # Release all chunks in the buffer that are at or before the threshold
+    while results_buffer and results_buffer[0]["chunk_index"] <= ready_chunk_index_threshold:
+        result_to_release = results_buffer.pop(0) # Get the oldest ready chunk
+        try:
+            # Put result onto the queue for websockets, with a timeout
+            await asyncio.wait_for(stream_result_queue.put(result_to_release), timeout=2.0)
+            logger.info(f"RELEASE: Sent chunk {result_to_release['chunk_index']} results to WS queue (QSize: {stream_result_queue.qsize()})")
+        except asyncio.TimeoutError:
+            # If queue is full (e.g., WS client disconnected/slow), log error and put it back
+            logger.error(f"RELEASE: Timeout putting chunk {result_to_release['chunk_index']} onto WS queue. Re-inserting into buffer.")
+            results_buffer.insert(0, result_to_release) # Put it back at the front
+            break # Stop trying to release more chunks for now if queue is blocked
+        except Exception as e:
+            # Handle other potential queue errors
+            logger.error(f"RELEASE: Failed to put chunk {result_to_release['chunk_index']} onto WS queue: {e}")
+            results_buffer.insert(0, result_to_release) # Put it back
+            break # Stop releasing on other errors too
 
 # === FastAPI Endpoints ===
+
 # --- STREAM Endpoints ---
+# (No changes needed for start, results WS, stop endpoints themselves)
 @app.post("/api/stream/analyze")
 async def start_stream_analysis(data: dict):
-    global stream_is_running, stream_active_tasks, stream_fact_check_buffer, stream_last_fact_check_time
+    global stream_is_running, stream_active_tasks, stream_fact_check_buffer, stream_last_fact_check_time, stream_result_queue
     url = data.get("url")
     if not url: raise HTTPException(status_code=400, detail="Stream URL required")
-    if stream_is_running: return {"message": "Already running."}
-    logger.info(f"Start analysis request: {url}")
-    stream_is_running = True; stream_fact_check_buffer = ""; stream_last_fact_check_time = time.time()
-    while not stream_result_queue.empty(): # Clear queue
+    if stream_is_running:
+        logger.warning("Start request received but stream is already running.")
+        return {"message": "Stream analysis is already running."}
+
+    logger.info(f"Start analysis request received for URL: {url}")
+
+    # --- Reset State ---
+    stream_is_running = True
+    stream_fact_check_buffer = ""
+    stream_last_fact_check_time = time.time() # Reset fact check timer
+
+    # Clear the result queue
+    while not stream_result_queue.empty():
         try: stream_result_queue.get_nowait(); stream_result_queue.task_done()
         except asyncio.QueueEmpty: break
-    for task in list(stream_active_tasks): task.cancel()
-    stream_active_tasks.clear()
+        except Exception as e: logger.warning(f"Error clearing result queue item: {e}")
+
+    # Cancel any lingering tasks from a previous run (shouldn't happen if stop works)
+    if stream_active_tasks:
+         logger.warning(f"Found {len(stream_active_tasks)} active tasks before start. Cancelling them.")
+         tasks_to_cancel = list(stream_active_tasks)
+         for task in tasks_to_cancel: task.cancel()
+         try:
+             # Give a short time for tasks to acknowledge cancellation
+             await asyncio.wait_for(asyncio.gather(*tasks_to_cancel, return_exceptions=True), timeout=1.0)
+         except asyncio.TimeoutError: logger.warning("Timeout waiting for old tasks to cancel during start.")
+         stream_active_tasks.clear() # Ensure set is empty
+
+    # --- Start Manager ---
+    # Create the main processing manager task
     asyncio.create_task(stream_processing_manager(url), name="stream_processing_manager")
-    logger.info("Stream manager task created.")
+    logger.info("Stream processing manager task created.")
     return {"message": "Stream analysis starting..."}
 
 @app.websocket("/api/stream/results")
 async def stream_results_websocket(websocket: WebSocket):
-    await websocket.accept(); client_id = f"{websocket.client.host}:{websocket.client.port}"
-    logger.info(f"WS client connected: {client_id}")
+    await websocket.accept()
+    client_id = f"{websocket.client.host}:{websocket.client.port}"
+    logger.info(f"WebSocket client connected: {client_id}")
+    queue_get_task = None
     try:
         while True:
-            result = await stream_result_queue.get()
-            try: await websocket.send_json(result)
-            except Exception as send_err: logger.error(f"WS Send Error {client_id}: {send_err}"); stream_result_queue.task_done(); break
-            stream_result_queue.task_done()
-    except asyncio.CancelledError: logger.info(f"WS task cancelled {client_id}.")
-    except Exception as e: logger.info(f"WS client {client_id} disconnected: {e}")
-    finally: logger.info(f"WS connection closed {client_id}"); await websocket.close()
+            # Use asyncio.create_task to allow breaking loop if websocket closes while waiting
+            queue_get_task = asyncio.create_task(stream_result_queue.get())
+            done, pending = await asyncio.wait(
+                {queue_get_task, asyncio.create_task(websocket.receive_text())}, # Also wait for potential close message
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if queue_get_task in done:
+                 result = queue_get_task.result()
+                 try:
+                     await websocket.send_json(result)
+                     stream_result_queue.task_done() # Mark task done only after successful send
+                 except Exception as send_err:
+                      logger.error(f"WS Send Error to {client_id}: {send_err}. Client likely disconnected.")
+                      # Don't mark task done, it wasn't processed by this client.
+                      # Re-queue? No, might lead to infinite loop if client never recovers.
+                      # Best to just break and let the next client get it (if any).
+                      stream_result_queue.task_done() # Or maybe mark done to avoid blocking? Let's mark done.
+                      break # Exit loop on send error
+            else:
+                 # The websocket.receive_text() task completed, likely a close message or error
+                 logger.info(f"WS client {client_id} sent message or disconnected while waiting for queue.")
+                 queue_get_task.cancel() # Cancel the pending queue.get()
+                 await asyncio.sleep(0) # Allow cancellation to register
+                 break # Exit loop
+
+    except asyncio.CancelledError:
+        logger.info(f"WebSocket task for {client_id} cancelled.")
+        if queue_get_task and not queue_get_task.done(): queue_get_task.cancel()
+    except Exception as e:
+        # Catch generic exceptions (like WebSocketDisconnect)
+        logger.info(f"WebSocket client {client_id} disconnected: {type(e).__name__} - {e}")
+        if queue_get_task and not queue_get_task.done(): queue_get_task.cancel()
+    finally:
+        logger.info(f"WebSocket connection closing for {client_id}")
+        # Ensure task done is called if we broke mid-process? Risky.
+        # WebSocket close handled automatically by FastAPI/Starlette context manager
+        # await websocket.close() # Usually not needed here
+
 
 @app.post("/api/stream/stop")
 async def stop_stream_analysis():
-    global stream_is_running, stream_active_tasks
-    if not stream_is_running: return {"message": "Not running."}
-    logger.info("Stop analysis request.")
-    stream_is_running = False
-    logger.info(f"Cancelling {len(stream_active_tasks)} stream tasks...")
-    tasks_to_wait = [task for task in list(stream_active_tasks) if not task.done()]
-    for task in tasks_to_wait: task.cancel()
-    if tasks_to_wait:
-        try: await asyncio.wait_for(asyncio.gather(*tasks_to_wait, return_exceptions=True), timeout=5.0)
-        except asyncio.TimeoutError: logger.warning("Timeout waiting for tasks cancel.")
-    stream_active_tasks.clear()
-    while not stream_result_queue.empty(): # Clear queue
-        try: stream_result_queue.get_nowait(); stream_result_queue.task_done()
-        except asyncio.QueueEmpty: break
-    logger.info("Stream analysis stopped.")
+    global stream_is_running, stream_active_tasks, stream_result_queue
+    if not stream_is_running:
+        logger.info("Stop request received but stream is not running.")
+        return {"message": "Stream analysis is not running."}
+
+    logger.info("Stop analysis request received.")
+    stream_is_running = False # Signal loops and tasks to stop
+
+    logger.info(f"Cancelling {len(stream_active_tasks)} active stream tasks...")
+    # Create a list of tasks to cancel *before* iterating
+    tasks_to_cancel = list(stream_active_tasks)
+    for task in tasks_to_cancel:
+        task.cancel()
+
+    # Wait for tasks to finish cancellation (with timeout)
+    if tasks_to_cancel:
+        try:
+            # Gather waits for all tasks, return_exceptions stops it from failing on first cancelled task
+            await asyncio.wait_for(asyncio.gather(*tasks_to_cancel, return_exceptions=True), timeout=5.0)
+            logger.info("Active stream tasks cancelled.")
+        except asyncio.TimeoutError:
+            logger.warning("Timeout waiting for stream tasks to complete cancellation.")
+        except Exception as e:
+             logger.error(f"Error during task cancellation gathering: {e}")
+
+    stream_active_tasks.clear() # Clear the set after attempting cancellation
+
+    # Clear the result queue after stopping tasks
+    logger.info("Clearing stream result queue...")
+    cleared_count = 0
+    while not stream_result_queue.empty():
+        try:
+            stream_result_queue.get_nowait()
+            stream_result_queue.task_done()
+            cleared_count += 1
+        except asyncio.QueueEmpty:
+            break
+        except Exception as e:
+            logger.warning(f"Error clearing stream result queue item: {e}")
+            # Break here to avoid potential infinite loop if task_done fails repeatedly
+            break
+    logger.info(f"Cleared {cleared_count} items from result queue.")
+
+    logger.info("Stream analysis stopped successfully.")
     return {"message": "Stream analysis stopped"}
 
 
-# === UPLOAD MODE ENDPOINTS and HELPERS (Using aiofiles) ===
+# === UPLOAD MODE ENDPOINTS and HELPERS ===
 
 async def broadcast_progress(progress: float):
+    # (No changes needed here)
     disconnected_clients = []
+    message = json.dumps({"progress": progress})
+    # Iterate over a copy of the list to allow safe removal
     for client in list(upload_progress_clients):
-        try: await client.send_text(json.dumps({"progress": progress}))
-        except Exception as e: logger.warning(f"Progress send fail: {e}. Removing."); disconnected_clients.append(client)
-    for client in disconnected_clients:
-        if client in upload_progress_clients: upload_progress_clients.remove(client)
+        try:
+            await client.send_text(message)
+        except Exception as e:
+            # Log specific exception type if useful (e.g., WebSocketDisconnect)
+            logger.warning(f"Progress send failed ({type(e).__name__}). Removing client.")
+            disconnected_clients.append(client)
 
-def consume_spark_results(video_path: str, timeout: int = 60) -> list:
-    logger.warning("Spark result consumption logic is placeholder.")
-    return []
+    # Remove disconnected clients from the main list
+    for client in disconnected_clients:
+        if client in upload_progress_clients:
+            try:
+                 upload_progress_clients.remove(client)
+            except ValueError:
+                 pass # Ignore if already removed somehow
+
+
+# --- Translate functions (no changes needed) ---
+async def translate_to_language(text: str, target_language: str) -> str:
+    if not text or not GROQ_API_KEY: return text
+    # Check if source and target are the same (case-insensitive)
+    if target_language.lower() == "english" and text.strip() == text: # Simple check for already English
+        # A more robust check might involve language detection if needed
+        return text
+
+    logger.debug(f"Translating to {target_language} using Groq...")
+    try:
+        # Use asyncio.to_thread for the blocking requests call
+        def do_translate():
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            payload = {
+                "model": "llama3-8b-8192", # Consider making model configurable
+                "messages": [
+                    {"role": "system", "content": f"Translate the following text accurately to {target_language}. Output *only* the translated text, without any introductory phrases, explanations, or quotation marks."},
+                    {"role": "user", "content": text}
+                ],
+                "max_tokens": 2048, # Adjust based on expected length
+                "temperature": 0.1 # Low temp for more deterministic translation
+            }
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=30) # 30s timeout
+                response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+                result = response.json()
+                translated_content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                # Clean up potential markdown or extra quotes (though prompt aims to avoid this)
+                return translated_content.strip().strip('"').strip("'").strip()
+            except requests.exceptions.Timeout:
+                logger.error(f"Translation request timed out after 30 seconds.")
+                return f"[Translation Timeout to {target_language}]"
+            except requests.exceptions.RequestException as req_err:
+                logger.error(f"Translation API request failed: {req_err}")
+                return f"[Translation API Error to {target_language}]"
+            except (KeyError, IndexError, AttributeError) as json_err:
+                 logger.error(f"Failed to parse translation API response: {json_err}. Response: {result if 'result' in locals() else 'N/A'}")
+                 return f"[Translation Response Parse Error to {target_language}]"
+
+        translated = await asyncio.to_thread(do_translate)
+        logger.debug(f"Translation result (truncated): {translated[:50]}...")
+        return translated
+    except Exception as e:
+        # Catch errors in the asyncio/threading logic itself
+        logger.error(f"Unexpected error during translation to {target_language}: {e}", exc_info=True)
+        return f"[Translation System Error to {target_language}]" # Return original text on failure
+
+async def translate_to_english(transcription: str, source_language: str) -> str:
+    # Normalize language codes/names if possible (e.g., 'en-US' -> 'en')
+    # Basic check:
+    if source_language.lower().startswith("en") or not transcription:
+        return transcription
+    logger.info(f"Translating from '{source_language}' to English...")
+    return await translate_to_language(transcription, "English")
+
 
 @app.post("/api/video/translate")
 async def translate_transcription_endpoint(data: dict):
-    transcription = data.get("transcription"); target_language = data.get("language", "en")
-    if not transcription: raise HTTPException(status_code=400, detail="Transcription required")
+    # (No changes needed here)
+    transcription = data.get("transcription")
+    target_language = data.get("language", "en") # Default to English
+    if not transcription:
+        raise HTTPException(status_code=400, detail="Transcription text required")
+    if not target_language:
+         raise HTTPException(status_code=400, detail="Target language required")
+
     try:
         translated_text = await translate_to_language(transcription, target_language)
         return {"translation": translated_text}
-    except Exception as e: logger.error(f"Translation endpoint error: {e}", exc_info=True); raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
-
-async def translate_to_language(text: str, target_language: str) -> str:
-    if not text or not GROQ_API_KEY: return text
-    logger.debug(f"Translating to {target_language}...")
-    try:
-        def do_translate():
-            url = "https://api.groq.com/openai/v1/chat/completions"; headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            payload = { "model": "llama3-8b-8192", "messages": [{"role": "system", "content": f"Translate the following text to {target_language}. Output only the translation."}, {"role": "user", "content": text}], "max_tokens": 1024, "temperature": 0.1 }
-            response = requests.post(url, headers=headers, json=payload, timeout=25); response.raise_for_status()
-            result = response.json().get("choices", [{}])[0].get("message", {}).get("content", text); return result.strip().strip('"').strip("'")
-        translated = await asyncio.to_thread(do_translate)
-        logger.debug(f"Translation result: {translated[:50]}...")
-        return translated
-    except Exception as e: logger.error(f"Translation to {target_language} failed: {e}"); return text
-
-async def translate_to_english(transcription: str, source_language: str) -> str:
-    if source_language == "en" or not transcription: return transcription
-    return await translate_to_language(transcription, "English")
+    except Exception as e:
+        logger.error(f"Translation endpoint error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
 @app.websocket("/api/video/progress")
 async def video_progress_websocket(websocket: WebSocket):
-    await websocket.accept(); client_id = f"{websocket.client.host}:{websocket.client.port}"
-    logger.info(f"Upload progress client connected: {client_id}"); upload_progress_clients.append(websocket)
+    # (No changes needed here)
+    await websocket.accept()
+    client_id = f"{websocket.client.host}:{websocket.client.port}"
+    logger.info(f"Upload progress client connected: {client_id}")
+    upload_progress_clients.append(websocket)
     try:
-        while True: await asyncio.sleep(3600)
-    except Exception: pass
+        # Keep connection open, wait for disconnect
+        while True:
+            # Keepalive or wait for close
+            await websocket.receive_text() # Wait for message (or disconnect)
+    except Exception as e:
+        # Handles WebSocketDisconnect, CancelledError etc.
+        logger.info(f"Upload progress client {client_id} disconnected: {type(e).__name__}")
     finally:
-        logger.info(f"Upload progress client disconnected: {client_id}")
-        if websocket in upload_progress_clients: upload_progress_clients.remove(websocket)
+        logger.info(f"Upload progress client connection closed: {client_id}")
+        if websocket in upload_progress_clients:
+            try: upload_progress_clients.remove(websocket)
+            except ValueError: pass # Ignore if already removed
 
 @app.post("/api/video/analyze")
 async def analyze_video_upload(file: UploadFile = File(...)):
-    temp_path = os.path.join(TEMP_DIR, f"upload_{int(time.time())}_{file.filename}")
-    logger.info(f"Upload: {file.filename} -> {temp_path}")
+    # --- Updated to handle new return structure from VideoAnalyzer ---
+    # Use a timestamp for uniqueness, sanitize filename
+    timestamp = int(time.time())
+    safe_filename = "".join(c for c in file.filename if c.isalnum() or c in ('_', '-')).rstrip()
+    temp_path = os.path.join(TEMP_DIR, f"upload_{timestamp}_{safe_filename}")
+    logger.info(f"Upload request: {file.filename} -> {temp_path}")
+
+    # Ensure progress starts at 0
+    await broadcast_progress(0.0)
+
     try:
         # Async save using aiofiles
-        content = await file.read()
-        async with aiofiles.open(temp_path, "wb") as f: await f.write(content)
-        logger.info(f"Upload saved: {temp_path}, size: {len(content)} bytes")
-        await broadcast_progress(0.05)
+        async with aiofiles.open(temp_path, "wb") as f:
+            # Read file in chunks to handle large uploads without excessive memory use
+            while content := await file.read(1024 * 1024): # Read 1MB chunks
+                 await f.write(content)
+        # Verify file saved
+        if not await aiofiles.os.path.exists(temp_path):
+             raise IOError(f"Failed to save uploaded file to {temp_path}")
+        stat_res = await aiofiles.os.stat(temp_path)
+        logger.info(f"Upload saved: {temp_path}, size: {stat_res.st_size} bytes")
+        await broadcast_progress(0.05) # Progress after save
 
-        # Direct Analysis Path
-        logger.info(f"Starting direct analysis: {os.path.basename(temp_path)}")
-        await broadcast_progress(0.1)
-        analysis_tuple = await asyncio.to_thread(video_analyzer.analyze_video, temp_path)
+        # --- Direct Analysis Path ---
+        logger.info(f"Starting direct analysis (incl. heatmaps): {os.path.basename(temp_path)}")
+        await broadcast_progress(0.1) # Progress before analysis starts
+
+        # Define progress callback function for VideoAnalyzer
+        async def upload_progress_update(analyzer_progress: float):
+             # Scale analyzer progress (0-1) to the backend progress range (0.1 to 0.95)
+             backend_progress = 0.1 + analyzer_progress * 0.85
+             await broadcast_progress(backend_progress)
+
+        # Call VideoAnalyzer.analyze_video in a thread
+        # It now returns: transcription, final_score, frames_data (with overlays), detected_language
+        analysis_tuple = await asyncio.to_thread(
+            video_analyzer.analyze_video,
+            temp_path,
+            upload_progress_update # Pass the async callback
+        )
         transcription, final_score, frames_data, detected_language = analysis_tuple
+
         logger.info(f"Direct video analysis done. Score: {final_score:.3f}, Lang: {detected_language}")
-        await broadcast_progress(0.4)
+        # Note: Progress is handled by the callback now
+
+        # Translate to English if needed (after video analysis)
         english_transcription = await translate_to_english(transcription, detected_language)
-        await broadcast_progress(0.5)
+        await broadcast_progress(0.96) # Progress after translation
+
+        # Run fact-check and text analysis (these don't have fine-grained progress)
         logger.info("Running fact-check...")
         fact_check_result = await asyncio.to_thread(fact_checker.check, english_transcription, num_workers=2)
-        await broadcast_progress(0.7)
-        logger.info("Running text analysis...")
-        text_analysis_result = await text_analyzer.analyze_text(english_transcription)
-        await broadcast_progress(0.9)
-        await broadcast_progress(1.0)
+        await broadcast_progress(0.97)
 
-        response = { "original_transcription": transcription, "detected_language": detected_language,
-                     "english_transcription": english_transcription, "final_score": final_score, "frames_data": frames_data,
-                     "text_analysis": { "political_bias": text_analysis_result.political_bias,
-                                        "emotional_triggers": text_analysis_result.emotional_triggers,
-                                        "stereotypes": text_analysis_result.stereotypes,
-                                        "manipulation_score": text_analysis_result.manipulation_score,
-                                        "entities": text_analysis_result.entities,
-                                        "locations": text_analysis_result.locations,
-                                        "fact_check_result": fact_check_result } }
+        logger.info("Running text analysis...")
+        text_analysis_result = await text_analyzer.analyze_text(english_transcription) # Assuming this is async or wrapped
+        await broadcast_progress(0.99)
+
+        # --- Prepare Final Response ---
+        response = {
+            "original_transcription": transcription,
+            "detected_language": detected_language,
+            "english_transcription": english_transcription,
+            "final_score": final_score, # Overall max deepfake score
+            "frames_data": frames_data, # Contains timestamps, scores, indices, overlays
+            "text_analysis": {
+                "political_bias": text_analysis_result.political_bias,
+                "emotional_triggers": text_analysis_result.emotional_triggers,
+                "stereotypes": text_analysis_result.stereotypes,
+                "manipulation_score": text_analysis_result.manipulation_score,
+                "entities": text_analysis_result.entities,
+                "locations": text_analysis_result.locations, # Passed through if available
+                "fact_check_result": fact_check_result
+            }
+        }
+        await broadcast_progress(1.0) # Final progress update
         logger.info(f"Analysis complete for {file.filename}.")
         return JSONResponse(content=response)
+
+    except FileNotFoundError as fnf_err:
+        logger.error(f"File not found during upload analysis: {fnf_err}")
+        await broadcast_progress(-1.0) # Signal error
+        raise HTTPException(status_code=404, detail=str(fnf_err))
+    except IOError as io_err:
+         logger.error(f"File save/read error during upload analysis: {io_err}")
+         await broadcast_progress(-1.0)
+         raise HTTPException(status_code=500, detail=f"File handling error: {io_err}")
     except Exception as e:
         logger.error(f"Error analyzing upload {file.filename}: {e}", exc_info=True)
-        await broadcast_progress(-1.0)
+        await broadcast_progress(-1.0) # Signal error
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
     finally:
+        # Ensure temporary upload file is deleted
         if 'temp_path' in locals() and await aiofiles.os.path.exists(temp_path):
-            try: await aiofiles.os.remove(temp_path); logger.info(f"Deleted temp upload: {temp_path}")
-            except Exception as e_del: logger.error(f"Failed delete {temp_path}: {e_del}")
+            try:
+                await aiofiles.os.remove(temp_path)
+                logger.info(f"Deleted temp upload file: {temp_path}")
+            except Exception as e_del:
+                logger.error(f"Failed to delete temp upload file {temp_path}: {e_del}")
 
 
 # === SHUTDOWN ===
@@ -538,37 +1009,82 @@ async def analyze_video_upload(file: UploadFile = File(...)):
 async def shutdown_event():
     global stream_is_running, stream_active_tasks
     logger.info("Application shutdown initiated.")
-    stream_is_running = False
+
+    # --- Stop Stream Gracefully ---
+    stream_is_running = False # Signal stream loops to stop
     if stream_active_tasks:
-        logger.info(f"Shutdown: Cancelling {len(stream_active_tasks)} stream tasks...")
-        for task in list(stream_active_tasks): task.cancel()
-        try: await asyncio.wait_for(asyncio.gather(*stream_active_tasks, return_exceptions=True), timeout=3.0)
-        except asyncio.TimeoutError: logger.warning("Timeout waiting stream tasks cancel.")
+        logger.info(f"Shutdown: Cancelling {len(stream_active_tasks)} active stream tasks...")
+        tasks_to_cancel = list(stream_active_tasks)
+        for task in tasks_to_cancel:
+            task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks_to_cancel, return_exceptions=True), timeout=3.0)
+            logger.info("Stream tasks cancellation complete.")
+        except asyncio.TimeoutError:
+            logger.warning("Timeout waiting for stream tasks to cancel during shutdown.")
+        except Exception as e:
+             logger.error(f"Error during stream task cancellation gathering: {e}")
         stream_active_tasks.clear()
-    # Close Kafka Producer
+
+    # --- Close External Connections ---
+    # Close Kafka Producer (if used)
     if video_producer:
-        try: logger.info("Closing Kafka producer..."); await asyncio.to_thread(video_producer.close); logger.info("Kafka producer closed.")
-        except Exception as e: logger.error(f"Error closing Kafka Producer: {e}")
-    # Close Neo4j
-    try: logger.info("Closing Neo4j connection..."); await asyncio.to_thread(fact_checker.close_neo4j); logger.info("Neo4j connection closed.")
-    except Exception as e: logger.error(f"Error closing Neo4j: {e}")
-    # Async cleanup of temp dir
+        try:
+            logger.info("Closing Kafka producer...")
+            await asyncio.to_thread(video_producer.close) # Ensure it's run in thread if blocking
+            logger.info("Kafka producer closed.")
+        except Exception as e:
+            logger.error(f"Error closing Kafka Producer: {e}")
+
+    # Close Neo4j (FactChecker handles this)
+    try:
+        logger.info("Closing Neo4j connection via FactChecker...")
+        # Assuming fact_checker.close_neo4j() is thread-safe or non-blocking
+        # If it's blocking, wrap in asyncio.to_thread
+        await asyncio.to_thread(fact_checker.close_neo4j)
+        logger.info("Neo4j connection closed.")
+    except Exception as e:
+        logger.error(f"Error closing Neo4j connection: {e}", exc_info=True)
+
+    # --- Async Cleanup of Temp Directory ---
     logger.info(f"Shutdown: Cleaning up temp directory: {TEMP_DIR}")
+    cleanup_tasks = []
     try:
         if await aiofiles.os.path.isdir(TEMP_DIR):
-            filenames = await asyncio.to_thread(os.listdir, TEMP_DIR)
-            tasks = []
-            for filename in filenames:
+            async for filename in aiofiles.os.listdir(TEMP_DIR):
                 file_path = os.path.join(TEMP_DIR, filename)
-                # Schedule deletion task for files
-                if await aiofiles.os.path.isfile(file_path):
-                     tasks.append(asyncio.create_task(aiofiles.os.remove(file_path), name=f"delete-{filename}"))
-            if tasks:
-                 await asyncio.gather(*tasks, return_exceptions=True) # Run deletions concurrently
-                 logger.info("Temp directory cleanup finished.")
+                # Check if it's a file before adding delete task
+                try:
+                     if await aiofiles.os.path.isfile(file_path):
+                          # Schedule deletion task for files (mp4, wav, jpg overlays etc.)
+                          cleanup_tasks.append(
+                              asyncio.create_task(aiofiles.os.remove(file_path), name=f"delete-{filename}")
+                          )
+                     else:
+                          logger.debug(f"Skipping cleanup for non-file item: {filename}")
+                except Exception as stat_err:
+                     logger.warning(f"Error stating file {file_path} during cleanup: {stat_err}")
+
+            if cleanup_tasks:
+                 logger.info(f"Attempting to delete {len(cleanup_tasks)} files from {TEMP_DIR}...")
+                 # Wait for all deletion tasks to complete
+                 results = await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+                 # Log any errors during deletion
+                 success_count = 0
+                 for i, result in enumerate(results):
+                     task_name = cleanup_tasks[i].get_name()
+                     if isinstance(result, Exception):
+                         logger.error(f"Failed to delete file during cleanup ({task_name}): {result}")
+                     else:
+                          success_count += 1
+                 logger.info(f"Temp directory cleanup finished. Deleted {success_count}/{len(cleanup_tasks)} files.")
             else:
-                 logger.info("Temp directory empty, no cleanup needed.")
-    except Exception as e_clean: logger.error(f"Error during temp dir cleanup: {e_clean}")
+                 logger.info("Temp directory empty or contained no files, no cleanup needed.")
+    except FileNotFoundError:
+        logger.info(f"Temp directory {TEMP_DIR} not found, skipping cleanup.")
+    except Exception as e_clean:
+        logger.error(f"Error during temp directory cleanup: {e_clean}", exc_info=True)
+
     logger.info("Application shutdown sequence finished.")
 
 
@@ -576,4 +1092,12 @@ async def shutdown_event():
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting Uvicorn server on http://127.0.0.1:5001")
-    uvicorn.run("main:app", host="127.0.0.1", port=5001, log_level="info", reload=True) # Added reload=True for dev
+    # Use log_config=None to rely on Python's logging setup
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=5001,
+        log_config=None, # Use our configured logger
+        # log_level="info", # Can be set, but log_config=None is preferred
+        reload=True # Keep reload for development
+    )
