@@ -85,3 +85,4 @@ spark-3.5.3-bin-hadoop3-scala2.13
 knowledge_graph.html
 *.wav
 *.mp4
+*.jpg

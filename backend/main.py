@@ -6,7 +6,6 @@ from fastapi.staticfiles import StaticFiles
 # --- Keep imports needed for BOTH modes ---
 from video_analyzer import VideoAnalyzer # Used by both
 from analyzer import OptimizedAnalyzer # Used by both (or parts of it)
-# ** Use the UPDATED detector for BOTH stream and internal video_analyzer use **
 from optimized_deepfake_detector import OptimizedDeepfakeDetector # Used directly by stream AND by video_analyzer
 from knowledge_graph import KnowledgeGraphManager # Used by Analyzer/FactChecker
 from fact_checker import FactChecker # Used by both
@@ -23,15 +22,13 @@ from dotenv import load_dotenv
 from typing import Dict, Any, List, Optional # Added Optional
 import aiofiles
 import aiofiles.os
-
-# --- Imports specifically for UPLOAD mode ---
-# (Keep existing imports like VideoProducer)
-
-# --- Imports specifically for STREAM mode ---
 from streamlink import Streamlink
 
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+HISTORY_LIMIT = 15
+CLEANUP_BUFFER = 5
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -328,200 +325,256 @@ async def stream_processing_manager(stream_url_platform: str):
 
 
 async def stream_processing_loop(stream_direct_url: str):
-    # (Needs modification for cleanup)
-    global stream_is_running, stream_active_tasks
+    """
+    Main asynchronous loop to download, analyze, and manage stream chunks.
+    """
+    global stream_is_running, stream_active_tasks # Access global state
     initial_buffer_duration = 5 # Reduced initial buffer wait
-    chunk_duration = 10
-    playback_delay = chunk_duration * 2 # Adjust playback delay (e.g., 2 chunks behind)
-    cycle_target_time = chunk_duration # Target one cycle per chunk duration
+    chunk_duration = 10 # Duration of each video chunk in seconds
+    playback_delay = chunk_duration * 2 # How far behind "live" playback should be
+    cycle_target_time = chunk_duration # Target time for one loop iteration
 
     logger.info(f"LOOP: Waiting {initial_buffer_duration}s for initial stream buffer...")
     try:
+        # Wait for the stream to buffer slightly at the beginning
         await asyncio.sleep(initial_buffer_duration)
     except asyncio.CancelledError:
-        logger.info("LOOP: Initial sleep cancelled."); return
+        logger.info("LOOP: Initial sleep cancelled.")
+        return # Exit if cancelled during initial wait
 
-    current_chunk_path_for_analysis = None
-    next_chunk_path_downloaded = None
-    download_task = None
-    analysis_task = None
-    chunk_index = 0
-    results_buffer = [] # Buffer for results ready to be released
-    stream_start_time = time.time()
-    last_successful_download_time = time.time()
-    max_consecutive_failures = 3 # Stop after N download/analysis failures
-    consecutive_failures = 0
+    # --- State Variables for the loop ---
+    current_chunk_path_for_analysis = None # Path of chunk N (to be analyzed)
+    next_chunk_path_downloaded = None    # Path of chunk N+1 (just downloaded)
+    download_task = None                 # asyncio.Task for current download
+    analysis_task = None                 # asyncio.Task for current analysis
+    chunk_index = 0                      # Counter for chunks processed
+    results_buffer = []                  # Buffer for completed analysis results ready for release
+    stream_start_time = time.time()      # Reference time for calculating playback position
+    last_successful_download_time = time.time() # Track health of download process
+    max_consecutive_failures = 3         # Threshold to stop if downloads/analyses fail repeatedly
+    consecutive_failures = 0             # Counter for failures
 
     logger.info("LOOP: Starting main processing cycle.")
     while stream_is_running:
         cycle_start_time = time.time()
         chunk_index += 1
+        # Define path for the chunk to be downloaded in this cycle (N+1)
         loop_chunk_output_path = os.path.join(TEMP_DIR, f"stream_chunk_{chunk_index}.mp4")
         logger.debug(f"LOOP: Cycle {chunk_index} starting.")
 
-        # --- 1. Start Download N+1 ---
-        if not stream_is_running: break
-        # Ensure previous download task is handled if somehow still running (shouldn't happen often)
+        # --- 1. Start Download Task for Chunk N+1 ---
+        if not stream_is_running: break # Check condition before starting task
+
+        # Safety check: Cancel previous download if somehow still running (should be rare)
         if download_task and not download_task.done():
             logger.warning(f"LOOP: Previous download task {download_task.get_name()} still running? Cancelling.")
             download_task.cancel()
-            # Allow cancellation to propagate
-            await asyncio.sleep(0.1)
+            try: await asyncio.sleep(0.1) # Allow cancellation to propagate
+            except asyncio.CancelledError: pass # Ignore if loop is stopping
             if download_task in stream_active_tasks: stream_active_tasks.remove(download_task)
 
+        # Create and start the download task
         download_task = asyncio.create_task(
             stream_download_chunk(stream_direct_url, loop_chunk_output_path, chunk_duration),
             name=f"download-{chunk_index}"
         )
         stream_active_tasks.add(download_task)
+        logger.debug(f"LOOP: Started download task {download_task.get_name()}.")
 
-        # --- 2. Schedule Analysis N ---
+
+        # --- 2. Schedule Analysis Task for Chunk N ---
+        # If we have a path from the *previous* cycle's successful download...
         if current_chunk_path_for_analysis and stream_is_running:
-            logger.debug(f"LOOP: Scheduling analysis for previous chunk {chunk_index - 1}")
-            # Ensure previous analysis task is handled
+            logger.debug(f"LOOP: Scheduling analysis for previous chunk {chunk_index - 1} ({os.path.basename(current_chunk_path_for_analysis)}).")
+
+            # Safety check: Cancel previous analysis if somehow still running
             if analysis_task and not analysis_task.done():
-                 logger.warning(f"LOOP: Previous analysis {analysis_task.get_name()} unfinished, cancelling.");
+                 logger.warning(f"LOOP: Previous analysis {analysis_task.get_name()} unfinished, cancelling.")
                  analysis_task.cancel()
-                 await asyncio.sleep(0.1) # Allow cancellation
+                 try: await asyncio.sleep(0.1) # Allow cancellation
+                 except asyncio.CancelledError: pass
                  if analysis_task in stream_active_tasks: stream_active_tasks.remove(analysis_task)
 
+            # Create and start the analysis task
             analysis_task = asyncio.create_task(
-                 stream_analyze_chunk(current_chunk_path_for_analysis, chunk_index - 1),
+                 stream_analyze_chunk(current_chunk_path_for_analysis, chunk_index - 1), # Analyze N-1
                  name=f"analyze-{chunk_index-1}"
              )
             stream_active_tasks.add(analysis_task)
-            # Add callback to handle result when done (and potential errors)
+            # Add a callback to process the result (or error) when the task completes
+            # The callback function (handle_analysis_completion) needs access to results_buffer
             analysis_task.add_done_callback(
                 lambda task: handle_analysis_completion(task, results_buffer)
             )
+            logger.debug(f"LOOP: Scheduled analysis task {analysis_task.get_name()}.")
+        elif not current_chunk_path_for_analysis and chunk_index > 1:
+             logger.warning(f"LOOP: No chunk path available to schedule analysis for chunk {chunk_index - 1}.")
 
-        # --- 3. Wait for Download N+1 ---
+
+        # --- 3. Wait for Download Task N+1 to Complete ---
         download_success = False
-        next_chunk_path_downloaded = None
+        next_chunk_path_downloaded = None # Reset path for this cycle
         if download_task:
             try:
-                # Wait slightly longer than target time for download flexibility
                 wait_start = time.time()
-                timeout_duration = cycle_target_time * 2.5 # Allow 2.5x chunk duration for download
+                # Set a reasonable timeout for the download
+                timeout_duration = cycle_target_time * 2.5 # e.g., 25 seconds for a 10s chunk
                 logger.debug(f"LOOP: Waiting for download {download_task.get_name()} (timeout: {timeout_duration:.1f}s)")
-                # await asyncio.wait_for(download_task, timeout=timeout_duration) # Use wait_for for clean timeout
-                # Alternative manual wait loop to check stream_is_running more often
-                while time.time() - wait_start < timeout_duration:
-                     if not stream_is_running: raise asyncio.CancelledError("Stream stopped during download wait")
-                     if download_task.done(): break
-                     await asyncio.sleep(0.1)
 
+                # Wait for the task, checking periodically if the stream should stop
+                while time.time() - wait_start < timeout_duration:
+                     if not stream_is_running:
+                         if not download_task.done(): download_task.cancel() # Cancel if stopping
+                         raise asyncio.CancelledError("Stream stopped during download wait")
+                     if download_task.done():
+                         break # Exit wait loop if task finished
+                     await asyncio.sleep(0.1) # Short sleep while waiting
+
+                # Check if the task timed out
                 if not download_task.done():
-                     # Task didn't finish in time
-                     download_task.cancel()
-                     await asyncio.sleep(0.1) # Allow cancellation
+                     download_task.cancel() # Cancel the overdue task
+                     try: await asyncio.sleep(0.1) # Allow cancellation
+                     except asyncio.CancelledError: pass
                      raise asyncio.TimeoutError(f"Download task {download_task.get_name()} timed out after {timeout_duration:.1f}s")
 
-                # Get result if task finished successfully
-                download_success = download_task.result() # Will re-raise exception if task failed
+                # If task completed (didn't time out), get its result
+                # This will re-raise any exception that occurred within the download task
+                download_success = download_task.result()
 
                 if download_success:
-                    next_chunk_path_downloaded = loop_chunk_output_path
-                    last_successful_download_time = time.time()
+                    next_chunk_path_downloaded = loop_chunk_output_path # Store path for next cycle's analysis
+                    last_successful_download_time = time.time() # Update health metric
                     consecutive_failures = 0 # Reset failure count on success
                     logger.debug(f"LOOP: Download {download_task.get_name()} successful.")
                 else:
-                    # Task finished but reported failure
+                    # The task finished but returned False (internal failure)
                     raise RuntimeError(f"Download task {download_task.get_name()} reported failure.")
 
             except (asyncio.CancelledError, asyncio.TimeoutError, RuntimeError) as e:
-                logger.error(f"LOOP: Download {download_task.get_name()} failed or stopped: {type(e).__name__} - {e}. Stopping stream.")
-                stream_is_running = False
+                # Handle expected failures gracefully
+                logger.error(f"LOOP: Download {download_task.get_name()} failed or stopped: {type(e).__name__} - {e}.")
                 consecutive_failures += 1
-                # Don't break immediately, allow potential analysis of previous chunk to finish?
-                # Or break now? Let's break to stop faster.
+                # If the stream was explicitly stopped, don't set stream_is_running = False here
+                if not isinstance(e, asyncio.CancelledError) or stream_is_running:
+                     stream_is_running = False # Stop the loop on download errors/timeouts
+                # Break the loop on critical download failures
                 break
             except Exception as e:
-                # Catch unexpected errors during await/result
+                # Handle unexpected errors during the wait/result retrieval
                 logger.error(f"LOOP: Unexpected error awaiting download {download_task.get_name()}: {e}", exc_info=True)
-                stream_is_running = False
                 consecutive_failures += 1
+                stream_is_running = False # Stop the loop
                 break
             finally:
-                 # Always remove task from active set
+                 # Always remove the download task from the active set once handled
                  if download_task in stream_active_tasks:
                      stream_active_tasks.remove(download_task)
 
-        # --- 4. Release Ready Results ---
-        try:
-            # Release results based on playback time + delay
-            await release_buffered_results(results_buffer, stream_start_time, playback_delay, chunk_duration)
-        except Exception as e:
-            logger.error(f"LOOP: Error releasing results: {e}")
 
-        # --- 5. Prep Next Cycle & Cleanup ---
-        # Set the chunk path for the *next* iteration's analysis task
+        # --- 4. Release Ready Results from Buffer ---
+        if stream_is_running: # Only release if we are still supposed to be running
+            try:
+                # Release results based on estimated playback time
+                await release_buffered_results(results_buffer, stream_start_time, playback_delay, chunk_duration)
+            except Exception as e:
+                logger.error(f"LOOP: Error releasing results: {e}")
+
+
+        # --- 5. Prep for Next Cycle & Cleanup Old Files ---
+        # Set the path for the *next* iteration's analysis task (chunk N+1 becomes N)
         current_chunk_path_for_analysis = next_chunk_path_downloaded
 
-        # Delete old chunk file AND its potential overlay file
-        chunk_to_delete_index = chunk_index - 4 # Keep N-1, N, N+1, N+2 (4 chunks total including download)
+        # --- Cleanup Logic ---
+        # Calculate the index of the oldest chunk file to delete
+        # Keep files for HISTORY_LIMIT items + a buffer
+        chunk_to_delete_index = chunk_index - (HISTORY_LIMIT + CLEANUP_BUFFER)
+
         if chunk_to_delete_index > 0:
+             logger.debug(f"LOOP: Checking for cleanup eligibility for index <= {chunk_to_delete_index}")
+             # Define base path without extension
              base_path_to_delete = os.path.join(TEMP_DIR, f"stream_chunk_{chunk_to_delete_index}")
              path_to_delete_mp4 = f"{base_path_to_delete}.mp4"
-             path_to_delete_overlay = f"{base_path_to_delete}_overlay.jpg"
+             path_to_delete_overlay = f"{base_path_to_delete}_overlay.jpg" # Overlay filename convention
 
-             # Delete MP4
-             if await aiofiles.os.path.exists(path_to_delete_mp4):
-                 try:
-                     await aiofiles.os.remove(path_to_delete_mp4)
-                     logger.debug(f"LOOP: Deleted old chunk {os.path.basename(path_to_delete_mp4)}")
-                 except Exception as e_del:
-                     logger.warning(f"LOOP: Failed to delete old chunk {path_to_delete_mp4}: {e_del}")
+             # Schedule deletion tasks to run concurrently using asyncio.create_task
+             delete_tasks = []
 
-             # Delete Overlay (if it exists)
-             if await aiofiles.os.path.exists(path_to_delete_overlay):
+             # --- Asynchronously Delete MP4 (if exists) ---
+             async def delete_file(f_path, f_type):
                  try:
-                     await aiofiles.os.remove(path_to_delete_overlay)
-                     logger.debug(f"LOOP: Deleted old overlay {os.path.basename(path_to_delete_overlay)}")
+                     if await aiofiles.os.path.exists(f_path):
+                         await aiofiles.os.remove(f_path)
+                         logger.info(f"LOOP: Deleted old {f_type} file: {os.path.basename(f_path)}")
+                     # else: logger.debug(f"LOOP: {f_type} file {f_path} already deleted or never existed.")
                  except Exception as e_del:
-                     logger.warning(f"LOOP: Failed to delete old overlay {path_to_delete_overlay}: {e_del}")
+                     logger.warning(f"LOOP: Failed to delete old {f_type} file {f_path}: {e_del}")
+
+             delete_tasks.append(asyncio.create_task(delete_file(path_to_delete_mp4, "chunk")))
+             delete_tasks.append(asyncio.create_task(delete_file(path_to_delete_overlay, "overlay")))
+
+             # Optional: Wait for deletions? Usually not necessary to block the loop.
+             # await asyncio.gather(*delete_tasks)
+             # Deletions will run in the background.
+
+        # --- END Cleanup Logic ---
 
 
         # --- 6. Timing & Health Check ---
         cycle_duration = time.time() - cycle_start_time
+        # Calculate how long to sleep to maintain the cycle time
         sleep_time = max(0, cycle_target_time - cycle_duration)
 
-        if cycle_duration > cycle_target_time * 1.1: # Log if significantly over time
+        if cycle_duration > cycle_target_time * 1.1: # Log if cycle takes >10% longer than target
             logger.warning(f"LOOP: Cycle {chunk_index} duration ({cycle_duration:.2f}s) exceeded target ({cycle_target_time:.1f}s).")
-            sleep_time = 0 # Don't sleep if already behind
+            sleep_time = 0 # Don't sleep if the loop is already falling behind
 
+        # --- Health Checks ---
         # Check if downloads have been failing for too long
-        if time.time() - last_successful_download_time > cycle_target_time * 4: # Increased tolerance (4 chunks missed)
-             logger.error("LOOP: No successful download in a while. Stopping stream.")
-             stream_is_running = False; break
+        # Allow ~4 missed chunks before giving up
+        if time.time() - last_successful_download_time > cycle_target_time * (max_consecutive_failures + 1):
+             logger.error(f"LOOP: No successful download in ~{cycle_target_time * (max_consecutive_failures + 1)}s. Stopping stream.")
+             stream_is_running = False # Signal stop
+             break # Exit loop
+
+        # Check if consecutive failures threshold reached
         if consecutive_failures >= max_consecutive_failures:
              logger.error(f"LOOP: Stopping stream after {consecutive_failures} consecutive failures.")
-             stream_is_running = False; break
+             stream_is_running = False # Signal stop
+             break # Exit loop
 
-        # Sleep for the remaining cycle time (if any)
-        if sleep_time > 0:
+        # --- Sleep ---
+        if sleep_time > 0 and stream_is_running:
             try:
+                # logger.debug(f"LOOP: Sleeping for {sleep_time:.2f}s")
                 await asyncio.sleep(sleep_time)
             except asyncio.CancelledError:
-                logger.info("LOOP: Cycle sleep cancelled."); break # Exit loop cleanly if cancelled
+                logger.info("LOOP: Cycle sleep cancelled.")
+                break # Exit loop cleanly if cancelled during sleep
 
+    # --- Loop Exit ---
     logger.info("LOOP: Exiting main processing loop.")
+
     # --- Final Cleanup Attempt ---
-    # Cancel any remaining analysis task on exit
+    # Cancel any remaining analysis task that might be running when the loop exits
     if analysis_task and not analysis_task.done():
         logger.info(f"LOOP: Cancelling final analysis task {analysis_task.get_name()} on exit.")
         analysis_task.cancel()
-        # Optionally wait briefly for cancellation
         try:
+             # Give it a very short time to finish cancellation
              await asyncio.wait_for(analysis_task, timeout=1.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
+             logger.debug(f"LOOP: Timeout or cancellation during final cleanup of task {analysis_task.get_name()}.")
              pass # Ignore timeout/cancel on final cleanup
         except Exception as e:
-             logger.warning(f"LOOP: Error during final analysis task cancellation: {e}")
+             # Log any other error during final cancellation
+             logger.warning(f"LOOP: Error during final analysis task cancellation ({analysis_task.get_name()}): {e}")
         finally:
-            if analysis_task in stream_active_tasks: stream_active_tasks.remove(analysis_task)
-    # Download task should have been handled within the loop
+            # Ensure it's removed from the active set
+            if analysis_task in stream_active_tasks:
+                stream_active_tasks.remove(analysis_task)
 
+    # Download task should have been handled within the loop's wait block or finally clause
+    logger.info("LOOP: Finished cleanup on exit.")
 
 def handle_analysis_completion(task: asyncio.Task, results_buffer: List):
     # (No changes needed here, it just passes the result dict which now might contain heatmap_url)
