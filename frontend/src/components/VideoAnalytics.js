@@ -324,7 +324,19 @@ const VideoAnalytics = () => {
                  <div className="translate-section">
                     <label htmlFor="language-select">Translate Original to:</label>
                     <select id="language-select" value={language} onChange={(e) => setLanguage(e.target.value)} disabled={loading}>
-                         <option value="en">English</option><option value="es">Spanish</option><option value="fr">French</option><option value="de">German</option><option value="zh-CN">Chinese (Simp)</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="ru">Russian</option><option value="ar">Arabic</option><option value="hi">Hindi</option><option value="bn">Bengali</option><option value="pt">Portuguese</option><option value="ta">Tamil</option><option value="te">Telugu</option> {/* Added Indian languages */}
+                    <option value="en">English</option>
+                        <option value="hi">Hindi (हिन्दी)</option>
+                        <option value="bn">Bengali (বাংলা)</option>
+                        <option value="mr">Marathi (मराठी)</option>
+                        <option value="te">Telugu (తెలుగు)</option>
+                        <option value="ta">Tamil (தமிழ்)</option>
+                        <option value="gu">Gujarati (ગુજરાતી)</option>
+                        <option value="kn">Kannada (ಕನ್ನಡ)</option>
+                        <option value="ml">Malayalam (മലയാളം)</option>
+                        <option value="pa">Punjabi (ਪੰਜਾਬੀ)</option>
+                        <option value="or">Odia (ଓଡ଼ିଆ)</option>
+                        <option value="as">Assamese (অসমীয়া)</option>
+                        <option value="ur">Urdu (اردو)</option>
                     </select>
                     <button onClick={handleTranslate} disabled={loading}> {loading ? 'Translating...' : 'Translate'} </button>
                     {translation && ( <div className="translated-text"><p><strong>Translated Text ({language}):</strong></p><textarea readOnly value={translation} rows={3}></textarea></div> )}

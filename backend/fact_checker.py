@@ -235,6 +235,7 @@ def preprocess_claim_for_api(original_claim: str) -> str:
 class FactChecker:
     def __init__(self):
         logging.info(f"Device set to use {DEVICE}")
+        logging.getLogger("neo4j").setLevel(logging.ERROR)
         try:
             logging.info(f"Load ST: {EMBEDDING_MODEL_NAME}"); self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=DEVICE)
             self.langchain_embeddings = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={'device': DEVICE}); logging.info("Models loaded.")
