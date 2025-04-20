@@ -91,6 +91,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%
 try: nltk.data.find('tokenizers/punkt')
 except: logging.info("Downloading NLTK 'punkt'..."); nltk.download('punkt', quiet=True); logging.info("'punkt' downloaded.")
 
+try: nltk.data.find('tokenizers/punkt_tab')
+except LookupError: # More specific exception
+    logging.info("Downloading NLTK 'punkt_tab' resource...")
+    nltk.download('punkt_tab', quiet=True)
+    logging.info("NLTK 'punkt_tab' downloaded.")
+
 # --- API Functions ---
 def google_fact_check(query: str, api_key: str) -> list:
     # Uses preprocessed query
@@ -235,7 +241,6 @@ def preprocess_claim_for_api(original_claim: str) -> str:
 class FactChecker:
     def __init__(self):
         logging.info(f"Device set to use {DEVICE}")
-        logging.getLogger("neo4j").setLevel(logging.ERROR)
         try:
             logging.info(f"Load ST: {EMBEDDING_MODEL_NAME}"); self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=DEVICE)
             self.langchain_embeddings = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={'device': DEVICE}); logging.info("Models loaded.")
