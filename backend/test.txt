@@ -1,0 +1,72 @@
+# --- Example Input Cases for Rigorous Testing ---
+
+# --- CASE 1: Basic Mix - Simple True, Simple False, Non-Checkable ---
+# Expected: 1 True (Full Pipeline/KG), 1 False (Full Pipeline/KG), 1 Filtered (Question), 1 Filtered (Opinion)
+# input_text = (
+#     "The Earth is flat. Paris is the capital of France. What is the current time? I think vanilla ice cream is the best."
+# )
+
+# --- CASE 2: More Nuance and Entities ---
+# Expected: Tests NER, potentially more complex RAG/LLM evaluation. Might hit KG on second run.
+# input_text = (
+#     "Barack Obama served two terms as the president of the United States. Apple's headquarters are located in Cupertino, California. The population of Tokyo exceeds 30 million people. Water always boils at 100 degrees Celsius everywhere on Earth." # Last one is subtly false (depends on pressure)
+# )
+
+# --- CASE 3: Claims Specifically for KG Testing (Run this multiple times) ---
+# Expected: First run -> Full Pipeline. Second run -> KG Hit for most/all.
+# input_text = (
+#     "The chemical symbol for Gold is Au. Jupiter is the largest planet in our solar system. The Great Wall of China is visible from the Moon with the naked eye. Humans have only explored about 5% of the Earth's oceans." # Third one is false.
+# )
+
+# --- CASE 4: Testing Filtering and Edge Cases ---
+# Expected: Most should be filtered out. Tests checkability logic.
+# input_text = (
+#     "This statement is a verifiable fact. Read the documentation carefully. How many planets are there? That movie was terrible! It feels like it might rain today. London is nice. Go away. This sentence is checkable."
+# )
+
+# --- CASE 5: Potentially Difficult/Obscure Claims ---
+# Expected: Tests RAG robustness, LLM reasoning with potentially sparse or conflicting evidence. May default to False if RAG fails.
+# input_text = (
+#     "The Voynich manuscript remains completely undeciphered. The Kleroterion was an ancient Greek randomization device used for jury selection. Liechtenstein is one of only two doubly landlocked countries in the world. The average hummingbird flaps its wings 80 times per second."
+# )
+
+# --- CASE 6: Empty and Very Short Input ---
+# Expected: Should handle gracefully, likely resulting in no checkable claims.
+# input_text = ""
+# OR
+# input_text = "Yes."
+
+# --- CASE 7: Mixed Checkable and Non-Checkable with Punctuation ---
+# Expected: Tests sentence splitting and filtering robustly.
+# input_text = (
+#     "The sun rises in the east! Isn't that amazing? Mount Everest is the tallest mountain. However, I believe K2 is more challenging. Penguins live primarily in the Southern Hemisphere. Go check that source."
+# )
+
+# --- CASE 8: Claim likely requiring LLM Reasoning on RAG Failure ---
+# Expected: Search might not find specific results for a nonsensical claim, testing the LLM's ability to return False based on lack of evidence.
+# input_text = (
+#     "Blue raspberries grow abundantly on Mars."
+# )
+
+# --- CASE 9: Longer Paragraph with Multiple Claims ---
+# Expected: Tests segmentation and processing of multiple sequential claims.
+# input_text = (
+#     "The Amazon rainforest produces 20% of the world's oxygen. This is a common misconception. While vital, its net contribution is closer to zero due to respiration. Brazil contains the largest part of the Amazon. Deforestation rates increased in recent years, which is a major concern. We must protect these forests."
+# )
+
+# --- CASE 10: Current Event (May change rapidly, tests API freshness) ---
+# Expected: Tests if APIs can retrieve reasonably current information. Result may vary.
+# input_text = (
+#     "The current Secretary-General of the United Nations is António Guterres." # As of late 2023/early 2024, this is true.
+# )
+
+# --- CURRENTLY SELECTED CASE ---
+# Choose one of the above cases to run by uncommenting it, or paste a new one here.
+# Remember to run cases like 3, 4, 5 multiple times to see KG interaction.
+input_text = (
+    "The Earth is flat. Paris is the capital of France. What is the current time? I think vanilla ice cream is the best."
+)
+
+
+# --- Main Execution Block (Keep as is) ---
+if __name__ == "__main__":
