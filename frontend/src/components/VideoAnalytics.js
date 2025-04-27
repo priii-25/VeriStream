@@ -410,7 +410,7 @@ const VideoAnalytics = () => {
                       analysisResult.text_analysis.fact_check_result.processed_claims.map((claim, idx) => (
                         <div key={idx} className="claim-detail">
                           <p><strong>Claim {idx + 1}:</strong> "{claim.original_claim || 'N/A'}"</p>
-                          <p>Verdict: <span className="highlight">{claim.final_verdict || 'N/A'}</span></p>
+                          <p>Verdict: <span className="highlight">{claim.final_label || 'N/A'}</span></p>
                           <p>Explanation: {claim.final_explanation || 'N/A'}</p>
                           <p><em>(Source: {claim.source || 'N/A'})</em></p>
                         </div>

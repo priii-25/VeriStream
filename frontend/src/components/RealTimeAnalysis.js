@@ -83,7 +83,7 @@ const AnalysisDetailsDisplay = React.memo(({ analysisData }) => {
                                      :
                                      <div key={idx} className="claim-detail">
                                          <p><strong>Claim {idx + 1}:</strong> "{claim.original_claim || 'N/A'}"</p>
-                                         <p>Verdict: <span className="highlight">{claim.final_verdict || 'N/A'}</span></p>
+                                         <p>Verdict: <span className="highlight">{claim.final_label || 'N/A'}</span></p>
                                      </div>
                                  ))
                              ) : (
