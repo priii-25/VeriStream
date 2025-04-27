@@ -7,7 +7,10 @@ import time
 import numpy as np
 import string
 import json
+from urllib.parse import urlparse # <-- Added for domain extraction
+
 # --- LLM/SHAP/NLP Imports ---
+# ... (imports remain the same) ...
 try:
     import shap
 except ImportError: shap = None
@@ -63,6 +66,7 @@ NEO4J_DATABASE = "veristream"
 KG_CONFIDENCE_THRESHOLD = 0.85 # Minimum confidence required to trust KG verdict
 
 # Clients
+# ... (Groq client initialization remains the same) ...
 groq_client = None
 if Groq and GROQ_API_KEY:
     try: groq_client = Groq(api_key=GROQ_API_KEY); logging.info("Groq client initialized.")
@@ -75,28 +79,59 @@ EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
 DEVICE = 'cpu' # Or 'cuda' if GPU is available and configured
 LLM_PROVIDER = "Groq"
 LLM_MODEL_NAME = "llama3-8b-8192"
-NUM_SEARCH_RESULTS = 5
+NUM_SEARCH_RESULTS = 10 # Fetch slightly more to allow for filtering
 RAG_K = 5
 # Keywords for filtering non-checkable claims
+# ... (OPINION_PHRASES, SUBJECTIVE_ADJECTIVES, SELF_REFERENCE_WORDS remain the same) ...
 OPINION_PHRASES = ["i think", "i believe", "in my opinion", "seems like", "feels like", "should be", "must be"]
 SUBJECTIVE_ADJECTIVES = ["beautiful", "ugly", "amazing", "terrible", "wonderful", "awful", "best", "worst", "nice", "bad", "good", "great"] # Added great
 SELF_REFERENCE_WORDS = ["this sentence", "this claim", "this statement", "i say", "i state", "this phrase"]
 KG_RELEVANT_NER_LABELS = {"PERSON", "ORG", "GPE", "LOC", "DATE", "TIME", "MONEY", "QUANTITY", "PERCENT", "CARDINAL", "ORDINAL", "PRODUCT", "EVENT", "WORK_OF_ART", "LAW", "NORP", "FAC"}
 
+# --- Credible Domain Filtering ---
+# *** NEW: Define the set of domains considered credible for RAG ***
+# This is an EXAMPLE set. Customize it based on your needs and trust criteria.
+# Domains should be listed WITHOUT 'www.' prefix for broader matching.
+CREDIBLE_DOMAINS = {
+    "wikipedia.org",
+    "reuters.com",
+    "apnews.com",
+    "bbc.com", "bbc.co.uk",
+    "nytimes.com",
+    "wsj.com",
+    "washingtonpost.com",
+    "nature.com",
+    "sciencemag.org",
+    "thelancet.com",
+    "nejm.org",
+    "cdc.gov",
+    "nih.gov",
+    "who.int",
+    "snopes.com",
+    "politifact.com",
+    "factcheck.org",
+    "*.gov", # Allow any .gov domain (handled in logic)
+    "*.edu", # Allow any .edu domain (handled in logic)
+    "*.org", # Be cautious with generic .org, consider specifics
+    # Add more specific news, scientific journals, government sites, etc.
+}
+
 # Logging
+# ... (Logging setup remains the same) ...
 log_file = 'fact_checker.log'
 # Clear log file at start
 with open(log_file, 'w', encoding='utf-8') as f: pass
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s', handlers=[logging.FileHandler(log_file, encoding='utf-8'), logging.StreamHandler(stream=sys.stdout)])
 
 # NLTK Downloads
+# ... (NLTK downloads remain the same) ...
 try: nltk.data.find('tokenizers/punkt')
 except LookupError: logging.info("Downloading NLTK 'punkt'..."); nltk.download('punkt', quiet=True); logging.info("'punkt' downloaded.")
-
 try: nltk.data.find('tokenizers/punkt_tab')
 except LookupError: logging.info("Downloading NLTK 'punkt_tab'..."); nltk.download('punkt_tab', quiet=True); logging.info("'punkt_tab' downloaded.")
 
 # --- API Functions ---
+# ... (google_fact_check remains the same) ...
 def google_fact_check(query: str, api_key: str) -> list:
     """Queries Google Fact Check API using the provided query string."""
     if not api_key: logging.error("GFactCheck Key missing."); return [{'verdict': 'Error', 'evidence': 'API Key missing'}]
@@ -126,8 +161,8 @@ def google_custom_search(query: str, api_key: str, cse_id: str, num: int) -> (di
     except requests.exceptions.RequestException as e: logging.error(f"Error GCustomSearch API: {e}"); return {}, [] # Graceful handle 429
     except Exception as e: logging.error(f"Error processing GCustomSearch: {e}"); return {}, []
 
-
 # --- *** REVISED LLM Final Verdict Function (v2) *** ---
+# ... (get_llm_final_verdict_v2 remains the same) ...
 def get_llm_final_verdict_v2(
     claim: str, # Use original claim
     initial_check_verdict: str,
@@ -166,7 +201,7 @@ def get_llm_final_verdict_v2(
     prompt = f"""You are an expert fact-checker and critical thinker. Your goal is to determine the most accurate final verdict (True/False) and confidence level for the 'Claim' by considering THREE sources of information:
 1.  **Your Internal Knowledge:** Assess the claim based on your general knowledge and reasoning abilities.
 2.  **Initial Fact-Check API Data:** Evaluate the preliminary verdict and source provided (if available and reliable).
-3.  **Retrieved Web Snippets (RAG):** Analyze the supporting/contradicting evidence from web search results.
+3.  **Retrieved Web Snippets (RAG):** Analyze the supporting/contradicting evidence from web search results (from specified credible sources, if any).
 
 Claim: "{claim}"
 
@@ -177,7 +212,7 @@ Claim: "{claim}"
 1.  **Evaluate the Claim:** Based *only* on your internal knowledge, is the claim likely True or False?
 2.  **Evaluate External Evidence:**
     *   Does the Initial Check provide a clear, relevant verdict? Is its source credible for *this specific claim*? (e.g., a health site commenting on physics might be less credible).
-    *   Do the RAG snippets directly support, contradict, or are they irrelevant to the claim? How consistent, relevant, and reliable do the RAG snippets seem?
+    *   Do the RAG snippets directly support, contradict, or are they irrelevant to the claim? How consistent, relevant, and reliable do the RAG snippets seem (note they are pre-filtered from credible domains)?
 3.  **Synthesize and Weigh:** Combine your internal assessment with the external evidence.
     *   If your knowledge strongly contradicts weak/irrelevant/conflicting external evidence, prioritize your knowledge.
     *   If external evidence (especially strong RAG) convincingly supports/contradicts the claim, give it significant weight, even if it counters your initial assessment (but double-check RAG relevance).
@@ -205,14 +240,14 @@ Example (RAG overrides Initial and weak internal):
 {{
   "verdict": "False",
   "confidence": 0.8,
-  "justification": "While internal knowledge might be uncertain, the Initial Check ('Distorts Facts') and multiple relevant RAG snippets consistently contradicted the claim's assertion about vaccine ineffectiveness. Verdict based on stronger external evidence."
+  "justification": "While internal knowledge might be uncertain, the Initial Check ('Distorts Facts') and multiple relevant RAG snippets from credible sources consistently contradicted the claim's assertion about vaccine ineffectiveness. Verdict based on stronger external evidence."
 }}
 
 Example (All sources weak/irrelevant):
 {{
   "verdict": "False",
   "confidence": 0.3,
-  "justification": "Internal knowledge cannot verify this specific claim. The Initial Check was 'Unknown' and the RAG snippets were irrelevant. Verdict is 'False' due to insufficient evidence from all sources."
+  "justification": "Internal knowledge cannot verify this specific claim. The Initial Check was 'Unknown' and the RAG snippets were irrelevant or from non-credible sources. Verdict is 'False' due to insufficient evidence from all sources."
 }}
 
 Your JSON Response:
@@ -272,8 +307,8 @@ Your JSON Response:
     except Exception as e: logging.error(f"Unexpected Groq API err for '{claim[:50]}...': {e}", exc_info=True); return {"final_label": "LLM Error", "confidence": 0.1, "explanation": f"API Err: {e}"}
 # --- End Revised LLM Function (v2) ---
 
-
 # --- Helper Functions ---
+# ... (is_claim_checkable remains the same) ...
 def is_claim_checkable(sentence: str) -> bool:
     """Checks if a sentence appears to be a checkable factual claim."""
     # No changes needed here based on requirements
@@ -312,6 +347,7 @@ def is_claim_checkable(sentence: str) -> bool:
     # If none of the above filters matched, assume it's checkable
     return True
 
+# ... (preprocess_claim_for_kg remains the same) ...
 def preprocess_claim_for_kg(original_claim: str) -> str:
     """
     Simplifies a claim primarily for matching against existing claims in the Knowledge Graph.
@@ -410,6 +446,7 @@ class FactChecker:
         self.raw_searches = {}    # Store raw search results
 
         # --- Neo4j Driver Initialization ---
+        # ... (Neo4j init remains the same) ...
         self.neo4j_driver = None
         if not NEO4J_URI or not NEO4J_USER or not NEO4J_PASSWORD:
             logging.error("Neo4j connection details (URI, USER, PASSWORD) missing in environment variables. KG features disabled.")
@@ -431,6 +468,7 @@ class FactChecker:
                 self.neo4j_driver = None
         # --- End Neo4j Init ---
 
+    # ... (check_kg_for_claim remains the same) ...
     def check_kg_for_claim(self, preprocessed_claim: str) -> dict | None:
         """
         Queries Neo4j using the *preprocessed* claim text to find a matching Claim node
@@ -493,6 +531,7 @@ class FactChecker:
             logging.error(f"KG Check Failed: Error querying Neo4j for '{preprocessed_claim}': {e}", exc_info=True)
             return None
 
+    # ... (store_in_neo4j remains the same) ...
     def store_in_neo4j(self, claim_data):
         """Stores the processed claim, verdict, entities, and evidence snippets in Neo4j."""
         if not self.neo4j_driver:
@@ -678,6 +717,7 @@ class FactChecker:
                 logging.error(f"Error storing/updating claim '{claim[:50]}...' in Neo4j: {e}", exc_info=True)
         # --- End Neo4j Transaction ---
 
+    # ... (preprocess_and_filter remains the same) ...
     def preprocess_and_filter(self, text: str) -> (list, list):
         """Segments text into sentences, filters non-checkable ones, and preprocesses checkable ones for KG lookup."""
         if not text or not isinstance(text, str):
@@ -731,6 +771,7 @@ class FactChecker:
         logging.info(f"Preprocessing complete. Found {len(checkable_claims_data)} checkable claims. Filtered {len(non_checkable_claims)} non-checkable sentences.")
         return checkable_claims_data, non_checkable_claims
 
+    # ... (classify_and_prioritize_claims remains the same) ...
     def classify_and_prioritize_claims(self, checkable_claims_data: list) -> list:
         """Assigns a 'factual score' and priority to checkable claims based on embedding norms."""
         # No changes needed here based on requirements - uses original_claim for scoring
@@ -769,6 +810,7 @@ class FactChecker:
             logging.error(f"Claim prioritization failed: {e}", exc_info=True)
             return checkable_claims_data # Return original list on error to avoid losing data
 
+    # ... (add_claims_to_queue remains the same) ...
     def add_claims_to_queue(self, claims_to_process: list):
         """Adds claims needing full processing to the worker queue."""
         # No changes needed here
@@ -781,13 +823,15 @@ class FactChecker:
                 logging.warning(f"Queue: Skipping invalid claim data item: {claim_data_dict}")
         logging.info(f"Queued {len(claims_to_process)} claims for full processing. Current Queue Size: {self.claim_queue.qsize()}")
 
-    # --- MODIFIED process_claim (v2) ---
+
+    # --- *** MODIFIED process_claim (v3 - with Domain Filtering) *** ---
     def process_claim(self, claim_data_dict: dict):
         """
         Processes a single claim that was *not* found in the KG.
         Uses ORIGINAL claim for API calls (GFactCheck, GSearch).
-        Uses ORIGINAL claim for RAG similarity search.
-        Uses ORIGINAL claim for LLM synthesis (which now includes internal knowledge).
+        Filters GSearch results by CREDIBLE_DOMAINS before RAG.
+        Uses ORIGINAL claim for RAG similarity search (on filtered results).
+        Uses ORIGINAL claim for LLM synthesis.
         Stores result in Neo4j using PREPROCESSED claim as key.
         """
         original_claim = claim_data_dict.get('original_claim')
@@ -822,140 +866,175 @@ class FactChecker:
         rag_evidence_for_llm = [] # Store structured RAG results for LLM
 
         # --- Step 1: Initial Fact Check (Google Fact Check API - using ORIGINAL claim) ---
-        initial_check_verdict = "N/A"
-        initial_check_evidence = "N/A"
+        # ... (This step remains the same) ...
+        initial_check_verdict = "N/A"; initial_check_evidence = "N/A"
         try:
-            # Use ORIGINAL claim for the API query
             initial_check_list = google_fact_check(original_claim, GOOGLE_API_KEY)
-            self.raw_fact_checks[original_claim] = initial_check_list # Store raw response
+            self.raw_fact_checks[original_claim] = initial_check_list
             if initial_check_list:
-                 initial_check = initial_check_list[0] # Take the first result
+                 initial_check = initial_check_list[0]
                  initial_check_verdict = initial_check.get('verdict', 'Error')
                  initial_check_evidence = initial_check.get('evidence', 'N/A')
-                 result['initial_verdict_raw'] = initial_check_verdict
-                 result['initial_evidence'] = initial_check_evidence
-                 # Handle potential errors reported by the API itself
-                 if initial_check_verdict == 'Error':
-                     logging.warning(f"GFactCheck API returned error for '{original_claim[:50]}...': {initial_check_evidence}")
+                 result['initial_verdict_raw'] = initial_check_verdict; result['initial_evidence'] = initial_check_evidence
+                 if initial_check_verdict == 'Error': logging.warning(f"GFactCheck API returned error for '{original_claim[:50]}...': {initial_check_evidence}")
             else:
-                 # API returned empty list (but no exception)
                  result['initial_verdict_raw'] = 'Error'; result['initial_evidence'] = 'API returned no data'
-                 initial_check_verdict = 'Error' # Ensure these are set for LLM input if API fails silently
-                 initial_check_evidence = 'API returned no data'
+                 initial_check_verdict = 'Error'; initial_check_evidence = 'API returned no data'
             logging.info(f"GFactCheck Result for '{original_claim[:50]}...': '{initial_check_verdict}'")
-        except Exception as e: # Catch unexpected errors in this block
+        except Exception as e:
             logging.error(f"GFactCheck call failed unexpectedly for '{original_claim[:50]}...': {e}", exc_info=True)
             result['initial_verdict_raw']="Error"; result['initial_evidence']=f"GFactCheck Exception: {e}"
             initial_check_verdict = 'Error'; initial_check_evidence = f"GFactCheck Exception: {e}"
 
+
         # --- Step 2: Google Custom Search (For RAG - using ORIGINAL claim) ---
+        # ... (This step remains largely the same, but status update moved slightly) ...
         search_results = []; full_search_resp = {}
         try:
             logging.debug(f"Attempting GCustomSearch for '{original_claim[:60]}...'");
-            # Use ORIGINAL claim for the search query
             full_search_resp, search_results = google_custom_search(original_claim, GOOGLE_API_KEY, GOOGLE_CSE_ID, NUM_SEARCH_RESULTS)
-            # Store raw response and parsed results
             self.raw_searches[original_claim] = {"query": original_claim, "response": full_search_resp, "results": search_results}
-
-            # Update RAG status based on search outcome
-            if not search_results and full_search_resp: # API OK, but no items found
-                result["rag_status"] = "Search OK, No Results"
-            elif not search_results and not full_search_resp: # API call likely failed (e.g., 429, network error)
-                result["rag_status"] = "Search Failed (API Error)"
-            elif search_results: # Got results
-                result["rag_status"] = "Search OK, Results Found"
-            else: # Should not happen if full_search_resp is None/empty and search_results is empty, but catch anyway
-                 result["rag_status"] = "Search Failed (Unknown Error)"
-            logging.info(f"GCustomSearch status for '{original_claim[:50]}...': {result['rag_status']}")
+            # Initial RAG status update will be refined after domain filtering
+            if not search_results and full_search_resp: result["rag_status"] = "Search OK, No Results"
+            elif not search_results and not full_search_resp: result["rag_status"] = "Search Failed (API Error)"
+            elif search_results: result["rag_status"] = "Search OK, Results Found" # Preliminary status
+            else: result["rag_status"] = "Search Failed (Unknown Error)"
+            logging.info(f"GCustomSearch raw results for '{original_claim[:50]}...': {len(search_results)} items. Status: {result['rag_status']}")
         except Exception as e:
             logging.error(f"GCustomSearch call failed unexpectedly for '{original_claim[:50]}...': {e}", exc_info=True)
             result["rag_status"]="Search Failed (Exception)"
             search_results=[] # Ensure search_results is empty list on error
 
-        # --- Step 3: RAG (Vector Search on Search Results - using ORIGINAL claim for retrieval) ---
-        if search_results:
-            documents=[]; vector_store=None
-            try:
-                min_snippet_len = 20 # Minimum characters for a snippet to be considered useful
-                # Filter results based on minimum length
-                valid_search_results = [sr for sr in search_results if len(sr.get('snippet', '')) >= min_snippet_len]
 
-                if not valid_search_results:
-                     result["rag_status"] = "Search OK, No Usable Snippets (Too Short)"
-                     logging.info(f"RAG Step skipped for '{original_claim[:50]}...': No search snippets met minimum length {min_snippet_len}.")
-                else:
-                    # Optional: Filter snippets for relevance to the original claim keywords
-                    # This might be redundant if similarity search works well, but can prune irrelevant results early
-                    claim_words = {w.lower() for w in original_claim.translate(str.maketrans('', '', string.punctuation)).split() if len(w)>2}
-                    relevant_search_results = [sr for sr in valid_search_results if any(w in sr['snippet'].lower() for w in claim_words)]
+        # --- Step 3: RAG (Filter by Domain, then Vector Search - using ORIGINAL claim for retrieval) ---
+        credible_search_results = [] # Store results passing the domain filter
+        if search_results: # Only proceed if initial search returned *something*
+            # --- *** NEW: Domain Filtering Logic *** ---
+            count_before_filter = len(search_results)
+            logging.debug(f"Filtering {count_before_filter} search results by credible domains...")
+            for sr in search_results:
+                link = sr.get('link')
+                if not link: continue # Skip if no link
+                try:
+                    parsed_uri = urlparse(link)
+                    # Extract domain, convert to lower, remove 'www.' if present
+                    domain = parsed_uri.netloc.lower()
+                    if domain.startswith('www.'):
+                        domain = domain[4:]
 
-                    if not relevant_search_results:
-                         result["rag_status"] = "Search OK, No Relevant Snippets Found"
-                         logging.info(f"RAG Step skipped for '{original_claim[:50]}...': No snippets seemed relevant based on keyword check.")
+                    # Check against CREDIBLE_DOMAINS set
+                    is_credible = False
+                    if domain in CREDIBLE_DOMAINS:
+                         is_credible = True
+                    # Handle wildcards like *.gov, *.edu
+                    elif domain.endswith(".gov") and "*.gov" in CREDIBLE_DOMAINS:
+                         is_credible = True
+                    elif domain.endswith(".edu") and "*.edu" in CREDIBLE_DOMAINS:
+                        is_credible = True
+                    # Add more specific wildcard checks if needed (e.g., *.nhs.uk)
+                    # elif domain.endswith(".org") and "*.org" in CREDIBLE_DOMAINS: # Be careful with generic .org
+                    #     is_credible = True
+
+                    if is_credible:
+                        credible_search_results.append(sr)
                     else:
-                        # Create LangChain Documents
-                        documents = [Document(page_content=sr['snippet'], metadata={'source':sr['link'],'title':sr['title']})
-                                     for sr in relevant_search_results]
+                         logging.debug(f"Filtered out result from domain '{domain}' (Link: {link})")
 
-                        if documents:
-                            try:
-                                # Create FAISS index from the relevant documents
-                                vector_store=FAISS.from_documents(documents, self.langchain_embeddings);
-                                logging.debug(f"FAISS index created from {len(documents)} documents for '{original_claim[:50]}...'.")
+                except Exception as url_e:
+                    logging.warning(f"Could not parse URL or check domain for link '{link}': {url_e}")
 
-                                # Perform similarity search using the ORIGINAL claim
-                                retrieved_docs = vector_store.similarity_search(original_claim, k=RAG_K);
+            count_after_filter = len(credible_search_results)
+            logging.info(f"Domain filtering kept {count_after_filter}/{count_before_filter} results for '{original_claim[:50]}...'.")
+            # --- *** End Domain Filtering Logic *** ---
 
-                                # Store structured results for LLM and formatted strings for output
-                                rag_evidence_for_llm = [{"content":doc.page_content,"metadata":doc.metadata} for doc in retrieved_docs]
-                                result['top_rag_snippets'] = [f"Snip {j+1}: \"{d['content'][:150].strip()}...\" ({d['metadata'].get('source','?')})" for j,d in enumerate(rag_evidence_for_llm)]
-                                result["rag_status"] = f"RAG OK ({len(rag_evidence_for_llm)}/{len(documents)} snippets retrieved/indexed)"
-                                logging.info(f"RAG status for '{original_claim[:50]}...': {result['rag_status']}")
+            # Update RAG status based on filtering outcome
+            if not credible_search_results and count_before_filter > 0:
+                result["rag_status"] = "Search OK, No Credible Domains Found"
+            elif not credible_search_results: # Should be covered by initial status update
+                 pass # Keep status like "Search OK, No Results" or "Search Failed"
+            else: # We have some credible results to process
+                result["rag_status"] = f"Search OK, Credible Results Found ({count_after_filter})"
 
-                            except Exception as faiss_e:
-                                 logging.error(f"FAISS/Embedding error during RAG for '{original_claim[:50]}...': {faiss_e}", exc_info=True)
-                                 result["rag_status"] = f"RAG Failed (FAISS/Embedding Error)"
-                                 rag_evidence_for_llm = [] # Clear evidence on error
-                                 result['top_rag_snippets'] = []
+            # --- Proceed with RAG only if credible results exist ---
+            if credible_search_results:
+                documents=[]; vector_store=None
+                try:
+                    min_snippet_len = 20 # Minimum characters for a snippet
+                    # Filter credible results based on minimum length
+                    valid_search_results = [sr for sr in credible_search_results if len(sr.get('snippet', '')) >= min_snippet_len]
+
+                    if not valid_search_results:
+                        result["rag_status"] = f"Search OK, No Usable Snippets (Credible domains={count_after_filter}, but snippets too short)"
+                        logging.info(f"RAG Step skipped for '{original_claim[:50]}...': No credible snippets met minimum length {min_snippet_len}.")
+                    else:
+                        # Optional: Keyword relevance filter (on already credible+long snippets)
+                        claim_words = {w.lower() for w in original_claim.translate(str.maketrans('', '', string.punctuation)).split() if len(w)>2}
+                        relevant_search_results = [sr for sr in valid_search_results if any(w in sr['snippet'].lower() for w in claim_words)]
+
+                        if not relevant_search_results:
+                            result["rag_status"] = f"Search OK, No Relevant Snippets Found (Credible domains={count_after_filter})"
+                            logging.info(f"RAG Step skipped for '{original_claim[:50]}...': No credible/long snippets seemed relevant based on keyword check.")
                         else:
-                            # This case should be caught by `if not relevant_search_results` check above, but handle defensively
-                            result["rag_status"] = "RAG Failed (No Documents after filtering)"
-                            rag_evidence_for_llm = []
-                            result['top_rag_snippets']=[]
+                            # Create LangChain Documents from relevant, credible results
+                            documents = [Document(page_content=sr['snippet'], metadata={'source':sr['link'],'title':sr['title']})
+                                         for sr in relevant_search_results]
 
-            except Exception as e: # Catch errors in the outer RAG try block (e.g., keyword processing)
-                logging.error(f"Outer RAG processing failed for '{original_claim[:50]}...': {e}",exc_info=True);
-                result["rag_status"]=f"RAG Failed (Processing Error: {type(e).__name__})"
-                rag_evidence_for_llm = [] # Clear evidence on error
-                result['top_rag_snippets'] = []
+                            if documents:
+                                try:
+                                    # Create FAISS index from the relevant documents
+                                    vector_store=FAISS.from_documents(documents, self.langchain_embeddings);
+                                    logging.debug(f"FAISS index created from {len(documents)} credible documents for '{original_claim[:50]}...'.")
+
+                                    # Perform similarity search using the ORIGINAL claim
+                                    retrieved_docs = vector_store.similarity_search(original_claim, k=RAG_K);
+
+                                    # Store structured results for LLM and formatted strings for output
+                                    rag_evidence_for_llm = [{"content":doc.page_content,"metadata":doc.metadata} for doc in retrieved_docs]
+                                    result['top_rag_snippets'] = [f"Snip {j+1}: \"{d['content'][:150].strip()}...\" ({d['metadata'].get('source','?')})" for j,d in enumerate(rag_evidence_for_llm)]
+                                    # Refined RAG status
+                                    result["rag_status"] = f"RAG OK ({len(rag_evidence_for_llm)}/{len(documents)} snippets retrieved/indexed from credible sources)"
+                                    logging.info(f"RAG status for '{original_claim[:50]}...': {result['rag_status']}")
+
+                                except Exception as faiss_e:
+                                     logging.error(f"FAISS/Embedding error during RAG for '{original_claim[:50]}...': {faiss_e}", exc_info=True)
+                                     result["rag_status"] = f"RAG Failed (FAISS/Embedding Error on credible results)"
+                                     rag_evidence_for_llm = [] # Clear evidence on error
+                                     result['top_rag_snippets'] = []
+                            else:
+                                # Should be caught by `if not relevant_search_results`
+                                result["rag_status"] = "RAG Failed (No Credible Documents after filtering)"
+                                rag_evidence_for_llm = []; result['top_rag_snippets']=[]
+
+                except Exception as e: # Catch errors in the outer RAG try block
+                    logging.error(f"Outer RAG processing failed for '{original_claim[:50]}...': {e}",exc_info=True);
+                    result["rag_status"]=f"RAG Failed (Processing Error on credible results: {type(e).__name__})"
+                    rag_evidence_for_llm = []; result['top_rag_snippets'] = []
+            # else: RAG status already updated (e.g., No Credible Domains Found)
+
         else:
-             # RAG status was already set based on search results (e.g., "Search Failed", "No Results")
-             # Ensure evidence lists are empty if search failed or yielded no results
-             rag_evidence_for_llm = []
-             result['top_rag_snippets'] = []
-             logging.info(f"RAG Step skipped for '{original_claim[:50]}...' due to previous search status: {result['rag_status']}")
+             # RAG status was already set based on initial search results (e.g., "Search Failed", "No Results")
+             rag_evidence_for_llm = []; result['top_rag_snippets'] = []
+             logging.info(f"RAG Step skipped for '{original_claim[:50]}...' due to initial search status: {result['rag_status']}")
+
 
         # --- Step 4: LLM Final Verdict (Synthesizing Initial Check + RAG + Internal Knowledge) ---
         logging.info(f"LLM generating final synthesized verdict for '{original_claim[:50]}...' (using internal knowledge)...");
-        # Use the revised LLM function v2
         llm_final_result = get_llm_final_verdict_v2(
-            claim=original_claim, # Pass original claim
+            claim=original_claim,
             initial_check_verdict=initial_check_verdict,
             initial_check_evidence=initial_check_evidence,
-            rag_evidence=rag_evidence_for_llm, # Pass structured RAG results
-            rag_status_msg=result['rag_status']
+            rag_evidence=rag_evidence_for_llm, # Pass structured RAG results (from credible sources)
+            rag_status_msg=result['rag_status'] # Pass the final RAG status
         )
-        # Store the synthesized results from the LLM
         result['final_label'] = llm_final_result['final_label']
         result['confidence'] = llm_final_result['confidence']
         result['final_explanation'] = llm_final_result['explanation']
 
         # --- Step 5: Store in Neo4j (using preprocessed_claim as key) ---
+        # ... (This step remains the same) ...
         try:
-            # Pass the final consolidated 'result' dictionary which includes the preprocessed_claim
             self.store_in_neo4j(result)
         except Exception as neo4j_e:
-            # Log error but don't overwrite the final verdict if storage fails
             logging.error(f"Neo4j storage failed for claim '{original_claim[:50]}...': {neo4j_e}", exc_info=True)
 
         # --- Final Logging ---
@@ -966,11 +1045,12 @@ class FactChecker:
             f"(Explain: {result['final_explanation'][:80]}...). "
             f"(Time:{processing_time:.2f}s)"
         )
-        # Store the final result (including LLM synthesis) in the shared dictionary
         with self.results_lock:
             self.results[original_claim] = result
 
+
     # --- Worker Function (unchanged) ---
+    # ... (worker method remains the same) ...
     def worker(self):
         """Worker thread function to process claims from the queue."""
         t_obj = current_thread(); t_name = t_obj.name; logging.info(f"Worker {t_name} started.")
@@ -1017,7 +1097,9 @@ class FactChecker:
 
         logging.info(f"Worker {t_name} finished.")
 
+
     # --- SHAP Function (unchanged, but acknowledges issues) ---
+    # ... (train_and_run_shap method remains the same) ...
     def train_and_run_shap(self, claims_processed_fully: list):
         """Attempts SHAP analysis on fully processed claims. Uses original claim text."""
         # SHAP requires the 'shap' library
@@ -1195,7 +1277,10 @@ class FactChecker:
             # Store error message in explanations
             self.shap_explanations = [{"claim": s, "shap_values": f"[SHAP Error: {type(e).__name__}]"} for s in sentences]
 
+
     # --- Chain of Thought and Check methods (minor adjustments for clarity) ---
+    # ... (generate_chain_of_thought and check methods remain largely the same,
+    #      but CoT should mention domain filtering if it occurred) ...
     def generate_chain_of_thought(self, all_processed_claims: list, non_checkable_claims: list) -> str:
         """Generates a step-by-step summary of the fact-checking process."""
         cot = ["Chain of Thought Summary:"]
@@ -1205,20 +1290,17 @@ class FactChecker:
         total_initial = len(all_processed_claims) + len(non_checkable_claims)
         cot.append(f"   - Initial Sentences Extracted: {total_initial}")
         if non_checkable_claims:
-            # Sort for consistent output order
             non_checkable_sorted = sorted(non_checkable_claims)
             cot.append(f"   - Filtered Non-Checkable ({len(non_checkable_sorted)}): {non_checkable_sorted}")
         cot.append(f"   - Checkable Claims Identified: {len(all_processed_claims)}")
 
         # Step 2: Preprocessing & Prioritization (for checkable claims)
-        # Separate KG hits from those needing full processing before showing prioritization
         kg_hits = [c for c in all_processed_claims if c.get('source') == 'Knowledge Graph']
         pipeline_processed = [c for c in all_processed_claims if c.get('source') == 'Full Pipeline']
         errors_or_preprocessing_failed = [c for c in all_processed_claims if c.get('source') == 'Error' or 'Error' in c.get('final_label','')]
 
         prioritized_for_pipeline = [c for c in pipeline_processed if 'priority' in c]
         if prioritized_for_pipeline:
-            # Sort by original claim text for consistent display
             checkable_claims_str = [f"'{c.get('original_claim','?')[:50]}...' (Prio:{c.get('priority',0.0):.3f})"
                                     for c in sorted(prioritized_for_pipeline, key=lambda x: x.get('original_claim', ''))]
             cot.append(f"   - Prioritized for Full Pipeline ({len(checkable_claims_str)}): [{', '.join(checkable_claims_str)}]")
@@ -1230,7 +1312,12 @@ class FactChecker:
         if kg_hits: cot.append(f"   - KG Hits ({len(kg_hits)}): Found existing reliable verdicts, skipped full pipeline.")
         else: cot.append("   - KG Hits: None found meeting criteria.")
 
-        if pipeline_processed: cot.append(f"   - Full Pipeline Execution ({len(pipeline_processed)}): Claims processed via APIs and Synthesizing LLM.")
+        if pipeline_processed:
+             cot.append(f"   - Full Pipeline Execution ({len(pipeline_processed)}): Claims processed via APIs, domain filtering, RAG, and Synthesizing LLM.")
+             # Check if domain filtering actually occurred for any pipeline claim
+             domain_filtered_statuses = [c.get('rag_status','') for c in pipeline_processed if 'credible' in c.get('rag_status','').lower() or 'domain' in c.get('rag_status','').lower()]
+             if domain_filtered_statuses:
+                  cot.append("     - RAG sources filtered by credible domains.")
         else: cot.append("   - Full Pipeline Execution: No claims required or completed full processing.")
 
         if errors_or_preprocessing_failed:
@@ -1240,7 +1327,6 @@ class FactChecker:
 
         # Step 4: Results Summary
         cot.append("3. Processed Claim Results (Sorted by Original Claim):")
-        # Sort all results together for final output
         all_processed_claims_sorted = sorted(all_processed_claims, key=lambda x: x.get('original_claim', ''))
         for i, res in enumerate(all_processed_claims_sorted):
                 claim = res.get('original_claim','?')
@@ -1258,7 +1344,7 @@ class FactChecker:
                     if kg_time: cot.append(f"     - KG Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(kg_time))}")
                 elif source == "Full Pipeline":
                      cot.append(f"     - Initial API Check: Verdict='{res.get('initial_verdict_raw','?')}' (Source: {res.get('initial_evidence','?')})")
-                     cot.append(f"     - RAG Status: {res.get('rag_status','?')}")
+                     cot.append(f"     - RAG Status: {res.get('rag_status','?')}") # Includes domain filtering info
                      # cot.append(f"     - Top RAG Snippets: {res.get('top_rag_snippets',[])}") # Maybe too verbose for CoT
                      cot.append(f"     - Final Verdict (LLM Synthesis): {final_label} (Confidence: {confidence:.2f})")
                      cot.append(f"     - LLM Justification: {explanation}")
@@ -1272,65 +1358,47 @@ class FactChecker:
         # Step 5: SHAP Summary
         cot.append("4. SHAP Analysis Summary (for fully processed claims):")
         if self.shap_explanations:
-             # Filter SHAP results to only include claims that were actually processed by the pipeline
              processed_claims_originals = {c['original_claim'] for c in pipeline_processed}
              relevant_explanations = [ex for ex in self.shap_explanations if ex.get('claim') in processed_claims_originals]
 
              if relevant_explanations:
                  sh_sum=[]; has_real_values=False; has_errors=False; all_zero=True
-                 # Sort by claim for consistent output
                  relevant_explanations_sorted = sorted(relevant_explanations, key=lambda x: x.get('claim', ''))
                  for ex in relevant_explanations_sorted:
                      claim_text = ex.get('claim', '?')[:40] + '...'
                      v = ex.get('shap_values', [])
                      s = "[Status Unknown]" # Default status string
-
                      if isinstance(v, list) and v:
-                         # Check for error strings first
                          if any(isinstance(val, str) and val.startswith('[SHAP') for val in v):
                              s = v[0] if v and isinstance(v[0], str) else "[SHAP Err Fallback]"
-                             has_errors = True
-                             all_zero = False
-                         # Check if all are numeric and near-zero
+                             has_errors = True; all_zero = False
                          elif all(isinstance(x, (int, float)) and abs(float(x)) < 1e-9 for x in v):
                              s = "[Zero Values]"
-                         # Check if numeric and has non-zero values
                          elif all(isinstance(x, (int, float)) for x in v):
                              s = f"[...{len(v)} SHAP vals...]"
-                             has_real_values = True
-                             all_zero = False
-                         else: # Mixed data types or other issue
-                             s = "[Mixed/Invalid Data]"
-                             all_zero = False
-                     elif isinstance(v, str) and v.startswith('[SHAP'): # SHAP failed entirely for this claim
-                         s = v
-                         has_errors = True
-                         all_zero = False
-                     elif not v: # Empty list
-                         s = "[No SHAP Data]"
-                         all_zero = False
-
+                             has_real_values = True; all_zero = False
+                         else: s = "[Mixed/Invalid Data]"; all_zero = False
+                     elif isinstance(v, str) and v.startswith('[SHAP'): s = v; has_errors = True; all_zero = False
+                     elif not v: s = "[No SHAP Data]"; all_zero = False
                      sh_sum.append(f"'{claim_text}': {s}")
 
-                 # Determine overall SHAP status message
                  status = "Unavailable/Not Run."
                  if has_real_values: status = "Generated values."
                  elif has_errors: status = "Failed/Unavailable (Errors encountered)."
                  elif all_zero and not has_errors and relevant_explanations: status = "Zero values reported (Prediction function likely unsuitable)."
-                 elif relevant_explanations: status = "Completed (No non-zero values or errors detected)." # Catch-all if logic above missed something
+                 elif relevant_explanations: status = "Completed (No non-zero values or errors detected)."
 
                  cot.append(f"   - SHAP Status: {status}")
                  if sh_sum: cot.append(f"   - Details: {{{', '.join(sh_sum)}}}")
 
              elif self.shap_available:
                  cot.append("   - SHAP analysis skipped: No claims processed via full pipeline or SHAP failed before value calculation.")
-             else: # SHAP library not installed
-                 cot.append("   - SHAP analysis skipped (library not installed).")
+             else: cot.append("   - SHAP analysis skipped (library not installed).")
         else:
-             # self.shap_explanations structure itself is missing or empty
             cot.append("   - SHAP analysis skipped (no results structure generated).")
 
         return "\n".join(cot)
+
 
     def check(self, text: str, num_workers: int = 2) -> dict:
         """
@@ -1346,7 +1414,6 @@ class FactChecker:
             self.raw_fact_checks = {}
             self.raw_searches = {}
         self.shap_explanations = [] # Clear previous SHAP explanations
-        # Clear the worker queue
         while not self.claim_queue.empty():
             try: self.claim_queue.get_nowait(); self.claim_queue.task_done()
             except queue.Empty: break
@@ -1356,13 +1423,11 @@ class FactChecker:
         # --- 1. Preprocessing, Filtering, and KG Key Generation ---
         logging.info("Step 1: Preprocessing, Filtering, and KG Key Generation...");
         try:
-            # Returns list of dicts for checkable claims, list of strings for non-checkable
             checkable_claims_initial_data, non_checkable_sents = self.preprocess_and_filter(text)
         except Exception as e:
             logging.critical(f"Fatal Error during Preprocessing/Filtering: {e}", exc_info=True)
             return {"processed_claims":[], "non_checkable_claims":[f"Error during preprocessing: {e}"], "summary":f"Fatal Error during Preprocessing: {e}", "raw_fact_checks":{}, "raw_searches":{}, "shap_explanations": []}
 
-        # If no checkable claims found, return early
         if not checkable_claims_initial_data:
             logging.warning("No checkable claims found after preprocessing and filtering.");
             summary = self.generate_chain_of_thought([], non_checkable_sents) # Generate summary based on filtering
@@ -1400,7 +1465,6 @@ class FactChecker:
                  preprocessed_claim_text = claim_data_dict.get('preprocessed_claim')
                  original_claim = claim_data_dict.get('original_claim', '?')
 
-                 # Validate essential data needed for KG check
                  if not preprocessed_claim_text or original_claim == '?':
                       logging.warning(f"Skipping KG check for claim due to missing preprocessed or original text: '{original_claim[:50]}...'")
                       claim_data_dict['source'] = 'Error'
@@ -1410,7 +1474,6 @@ class FactChecker:
                       claims_with_errors_pre_pipeline.append(claim_data_dict)
                       continue # Don't check KG or queue
 
-                 # Perform the KG lookup
                  kg_result = self.check_kg_for_claim(preprocessed_claim_text)
                  if kg_result:
                      claims_found_in_kg.append(kg_result) # Store the result from KG
@@ -1426,7 +1489,6 @@ class FactChecker:
 
             logging.info("Step 4b: Starting worker threads for parallel processing...");
             threads = []; n_cpu = os.cpu_count() or 1;
-            # Determine number of workers: min(requested, queue_size, cpu_cores)
             n_workers = min(num_workers, self.claim_queue.qsize(), n_cpu if n_cpu else 1)
 
             if n_workers > 0:
@@ -1436,14 +1498,11 @@ class FactChecker:
                     t.start();
                     threads.append(t)
 
-                # Wait for all tasks in the queue to be processed
                 self.claim_queue.join();
                 logging.info("All claims processed by workers (queue is empty).")
 
-                # Optionally signal workers to stop (using None sentinel) - not strictly needed with daemon threads if join works
-                # for _ in range(n_workers): self.claim_queue.put(None)
+                # for _ in range(n_workers): self.claim_queue.put(None) # Optional sentinel
 
-                # Wait for worker threads to finish
                 for t in threads:
                     t.join(timeout=10.0) # Add a timeout to join
                     if t.is_alive(): logging.warning(f"Thread {t.name} did not terminate gracefully after join timeout!")
@@ -1455,7 +1514,6 @@ class FactChecker:
 
         # --- 5. Generate SHAP Explanations (if available and needed) ---
         logging.info("Step 5: Generating SHAP explanations (if available)...");
-        # Run SHAP only on the claims that actually went through the full pipeline
         self.train_and_run_shap(claims_to_process_fully)
 
         # --- 6. Consolidate Final Results ---
@@ -1464,34 +1522,26 @@ class FactChecker:
         processed_count = 0
         error_count = 0
 
-        # Add results from KG hits
         final_results_list.extend(claims_found_in_kg)
         processed_count += len(claims_found_in_kg)
-
-        # Add results from pre-pipeline errors
         final_results_list.extend(claims_with_errors_pre_pipeline)
         processed_count += len(claims_with_errors_pre_pipeline)
         error_count += len(claims_with_errors_pre_pipeline)
 
-        # Retrieve results from the shared dictionary for claims processed by workers
         with self.results_lock:
             for claim_data_dict in claims_to_process_fully:
                  original_claim = claim_data_dict.get('original_claim')
-                 if not original_claim: continue # Should not happen, but safeguard
+                 if not original_claim: continue
 
                  pipeline_result = self.results.get(original_claim)
                  if pipeline_result:
-                      # Avoid duplicates if somehow added earlier (e.g., error fallback)
                       if not any(res.get('original_claim') == original_claim for res in final_results_list):
                            final_results_list.append(pipeline_result)
                            processed_count += 1
-                           # Count errors from the pipeline stage
                            if pipeline_result.get("source") == "Error" or "Error" in pipeline_result.get("final_label",""):
                                error_count += 1
                  else:
-                      # This indicates a problem - worker finished but result missing
                       logging.error(f"Result missing from self.results for fully processed claim: '{original_claim}'. This indicates a potential bug or lost result.")
-                      # Add an error entry to signify the loss
                       error_entry = {
                           "original_claim": original_claim,
                           "preprocessed_claim": claim_data_dict.get('preprocessed_claim','?'),
@@ -1512,7 +1562,7 @@ class FactChecker:
 
         # --- 8. Final Logging and Return ---
         duration = time.time() - start_time
-        pipeline_ok_count = len([r for r in final_results_list if r.get('source') == 'Full Pipeline' and r.get('final_label') not in ["Error", "LLM Error", "Processing Error"]])
+        pipeline_ok_count = len([r for r in final_results_list if r.get('source') == 'Full Pipeline' and r.get('final_label') not in ["Error", "LLM Error", "Processing Error", "Missing Result"]])
         logging.info(
             f"Check Complete. Total Initial Checkable={len(checkable_claims_initial_data)}, "
             f"KG Hits={len(claims_found_in_kg)}, Pipeline OK={pipeline_ok_count}, "
@@ -1528,6 +1578,7 @@ class FactChecker:
             "shap_explanations": self.shap_explanations
             }
 
+    # ... (close_neo4j remains the same) ...
     def close_neo4j(self):
         """Closes the Neo4j driver connection if it's open."""
         if self.neo4j_driver:
@@ -1588,13 +1639,14 @@ if __name__ == "__main__":
         exit(1)
 
     # --- Input Text ---
+    # Added a claim more likely to hit diverse web sources
     input_text = (
         "The Eiffel Tower is located in Berlin. Fact checkers say this is false. "
         "I think Paris is the most beautiful city. COVID-19 vaccines are ineffective according to some studies. "
         "Water boils at 100 degrees Celsius at sea level. This statement is true. "
-        "The earth is flat according to some sources. Llamas are native to North America, not South America. "
+        "The earth is flat according to some sources found on YouTube. Llamas are native to North America, not South America. " # Modified slightly
         "Quantum computing will break all encryption soon. This sentence should be ignored."
-        "Is VeriStream the best fact-checker?"
+        "Is VeriStream the best fact-checker? Pluto is considered a major planet by the IAU." # Added another factual claim
     )
     print(f"\n--- Input Text to Check ---\n{input_text}\n" + "-"*27)
 
@@ -1616,6 +1668,7 @@ if __name__ == "__main__":
     print("\n--- Fact Check Results ---")
 
     # 1. Raw Google Fact Check API Results (Optional Detail)
+    # ... (Output remains the same) ...
     print("\n" + "="*25 + " Intermediate Output 1: Raw Google Fact Check API Results " + "="*15)
     raw_checks = results_data.get("raw_fact_checks", {})
     if raw_checks:
@@ -1632,12 +1685,15 @@ if __name__ == "__main__":
     else: print("  - No Fact Check API calls were made or results stored (e.g., all KG hits or errors before API call).")
     print("="*81)
 
+
     # 2. Raw Google Custom Search Results (Optional Detail)
-    SHOW_RAW_SEARCH = False # Set to True to see raw search snippets
+    SHOW_RAW_SEARCH = False # Set to True to see raw search snippets (including non-credible)
+    SHOW_FILTERED_SEARCH = True # Set to True to see snippets *after* domain filtering
     raw_searches = results_data.get("raw_searches", {})
+
     if SHOW_RAW_SEARCH and raw_searches:
-        print("\n" + "="*25 + " Intermediate Output 2: Raw Google Custom Search Snippets " + "="*14)
-        print(" (Note: Shows results only for claims requiring RAG, using original claim as query)")
+        print("\n" + "="*25 + " Intermediate Output 2a: Raw Google Custom Search Snippets (Before Filtering) " + "="*2)
+        print(" (Note: Shows raw results only for claims requiring RAG, using original claim as query)")
         for claim in sorted(raw_searches.keys()): # Sort claims
             search_data = raw_searches[claim]
             print(f"\nClaim (Original Query): \"{claim}\"")
@@ -1651,7 +1707,47 @@ if __name__ == "__main__":
             else: print("  - Search API call likely failed or response structure was missing.")
         print("="*81)
 
+    if SHOW_FILTERED_SEARCH and raw_searches:
+         print("\n" + "="*25 + " Intermediate Output 2b: Google Custom Search Snippets (After Domain Filtering) " + "="*1)
+         print(f" (Note: Showing snippets from allowed domains: {CREDIBLE_DOMAINS})")
+         any_shown = False
+         for claim in sorted(raw_searches.keys()):
+            search_data = raw_searches[claim]
+            original_results = search_data.get("results", [])
+            credible_results_filtered = []
+            if original_results:
+                 # Re-apply filtering logic for display purposes
+                 for sr in original_results:
+                     link = sr.get('link')
+                     if not link: continue
+                     try:
+                         parsed_uri = urlparse(link)
+                         domain = parsed_uri.netloc.lower()
+                         if domain.startswith('www.'): domain = domain[4:]
+                         is_credible = (domain in CREDIBLE_DOMAINS or
+                                        (domain.endswith(".gov") and "*.gov" in CREDIBLE_DOMAINS) or
+                                        (domain.endswith(".edu") and "*.edu" in CREDIBLE_DOMAINS))
+                         if is_credible: credible_results_filtered.append(sr)
+                     except Exception: pass # Ignore parsing errors for display
+
+            if credible_results_filtered:
+                any_shown = True
+                print(f"\nClaim (Original Query): \"{claim}\" - Found {len(credible_results_filtered)} Credible Snippets")
+                for i, item in enumerate(credible_results_filtered):
+                    print(f"  {i+1}. Title: {item.get('title','?')}")
+                    print(f"     Snippet: {item.get('snippet','?')}")
+                    print(f"     Link: {item.get('link','?')}")
+            # Optionally, show claims that had results but none were credible
+            elif original_results:
+                print(f"\nClaim (Original Query): \"{claim}\" - No credible snippets found (Original count: {len(original_results)})")
+                any_shown = True
+
+         if not any_shown: print("  - No claims required RAG or no credible snippets were found for any claim.")
+         print("="*81)
+
+
     # 3. Filtered Non-Checkable Sentences
+    # ... (Output remains the same) ...
     print("\n" + "="*25 + " Preprocessing Output: Filtered Non-Checkable Sentences " + "="*16)
     non_checkable = results_data.get("non_checkable_claims", [])
     if non_checkable:
@@ -1660,27 +1756,27 @@ if __name__ == "__main__":
     else: print("  - No sentences were filtered out as non-checkable.")
     print("="*81)
 
+
     # 4. Final Processed Claim Details (Main Output)
+    # ... (Output format remains the same, but rag_status will reflect filtering) ...
     print("\n" + "="*30 + " Final Processed Claim Details " + "="*30)
     processed_claims = results_data.get("processed_claims", [])
     if processed_claims:
-        # Sort final results by the original claim text for consistent display
         sorted_results = sorted(processed_claims, key=lambda x: x.get('original_claim', ''))
         for i, res in enumerate(sorted_results):
-            # Extract all relevant fields with defaults
             source = res.get('source', 'Unknown')
             final_label = res.get('final_label', 'N/A')
             confidence = res.get('confidence', 0.0)
             explanation = res.get('final_explanation', 'N/A')
             original_claim = res.get('original_claim', '?')
-            preprocessed_claim = res.get('preprocessed_claim', 'N/A') # Key used for KG
-            factual_score = res.get('factual_score') # May be None if not calculated
+            preprocessed_claim = res.get('preprocessed_claim', 'N/A')
+            factual_score = res.get('factual_score')
             initial_verdict = res.get('initial_verdict_raw', 'N/A')
             initial_evidence = res.get('initial_evidence', 'N/A')
             rag_status = res.get('rag_status', 'N/A')
             ner_entities = res.get('ner_entities', [])
-            top_snippets = res.get('top_rag_snippets', []) # Formatted strings
-            kg_timestamp = res.get('kg_timestamp') # Timestamp from KG if applicable
+            top_snippets = res.get('top_rag_snippets', [])
+            kg_timestamp = res.get('kg_timestamp')
 
             print(f"\n--- Claim {i+1} ---")
             print(f"Original Claim: \"{original_claim}\"")
@@ -1692,11 +1788,11 @@ if __name__ == "__main__":
                 else: print("  - NER Entities: None Found or Extracted")
                 print(f"  - Priority Score (Heuristic): {factual_score:.3f}" if factual_score is not None else "N/A")
                 print(f"  - Initial API Check: Verdict='{initial_verdict}', Source='{initial_evidence}'")
-                print(f"  - RAG Status: {rag_status}")
+                print(f"  - RAG Status: {rag_status}") # This now reflects domain filtering
                 if top_snippets:
-                    print("  - Top RAG Snippets Retrieved:")
+                    print("  - Top RAG Snippets Retrieved (from Credible Domains):")
                     for j, snip in enumerate(top_snippets): print(f"    {j+1}. {snip}")
-                else: print("  - Top RAG Snippets Retrieved: None")
+                else: print("  - Top RAG Snippets Retrieved: None (or none passed filtering)")
                 print(f"  - Final Verdict (LLM Synthesized): {final_label}")
                 print(f"  - Confidence: {confidence:.2f}")
                 print(f"  - LLM Justification: {explanation}")
@@ -1713,7 +1809,7 @@ if __name__ == "__main__":
                 print(f"  - Final Verdict: {final_label}")
                 print(f"  - Confidence: {confidence:.2f}")
                 print(f"  - Error Explanation: {explanation}")
-            else: # Should not happen
+            else:
                  print(f"  - Status: Unknown processing source '{source}' or incomplete result format.")
                  print(f"  - Details: Label={final_label}, Conf={confidence:.2f}, Explain={explanation}")
             print("-" * 15) # Separator for claims
@@ -1721,26 +1817,22 @@ if __name__ == "__main__":
     else: print("  - No checkable claims were processed or results available.")
     print("="*83)
 
+
     # 5. XAI (SHAP) Summary
+    # ... (Output remains the same) ...
     print("\n" + "="*30 + " XAI (SHAP) Summary " + "="*37)
     shap_explanations = results_data.get("shap_explanations", [])
     if shap_explanations:
-         # Filter to show only SHAP results for claims that *should* have them (processed fully)
          fully_processed_claims_texts = {p['original_claim'] for p in processed_claims if p.get('source') == 'Full Pipeline'}
          relevant_explanations = [ex for ex in shap_explanations if ex.get('claim') in fully_processed_claims_texts]
-
          if relevant_explanations:
              print(f" (Note: Shows SHAP status for {len(relevant_explanations)} claim(s) processed via full pipeline)")
              shap_summary_lines=[]; has_real_values=False; has_errors=False; all_zero=True
-
-             # Sort by claim for consistent output
              relevant_explanations_sorted = sorted(relevant_explanations, key=lambda x: x.get('claim', ''))
              for expl in relevant_explanations_sorted:
                  claim_text = expl.get('claim', '?')[:40] + '...'
                  v = expl.get('shap_values', [])
-                 s = "[Status Unknown]" # Default status string
-
-                 # Determine status string based on SHAP values content
+                 s = "[Status Unknown]"
                  if isinstance(v, list) and v:
                      if any(isinstance(val, str) and val.startswith('[SHAP') for val in v):
                          s = v[0] if v and isinstance(v[0], str) else "[SHAP Err Fallback]"
@@ -1756,10 +1848,8 @@ if __name__ == "__main__":
                      s = v; has_errors = True; all_zero = False
                  elif not v:
                      s = "[No SHAP Data]"; all_zero = False
-
                  shap_summary_lines.append(f"  - '{claim_text}': {s}")
 
-             # Determine overall SHAP status message
              status = "Unavailable/Not Run."
              if has_real_values: status = "Generated numerical values."
              elif has_errors: status = "Failed/Unavailable (Errors encountered)."
@@ -1770,20 +1860,19 @@ if __name__ == "__main__":
              if shap_summary_lines:
                   print("  Claim-Specific Status:")
                   print("\n".join(shap_summary_lines))
-
-             # Add warning messages based on status
              if has_errors: print(f"\n  *** SHAP Error Detected: Check '{log_file}' for detailed SHAP errors. ***")
              elif all_zero and relevant_explanations: print(f"\n  *** SHAP produced zero values: The current prediction function (embedding norm) may be too simple for SHAP analysis. Check '{log_file}'. ***")
 
          elif checker and checker.shap_available:
              print("  - SHAP analysis not applicable: No claims required full processing, or SHAP failed before generating results.")
-         else: # SHAP library not installed
+         else:
               print("  - SHAP analysis skipped (library not installed).")
     else:
          print("  - SHAP analysis results structure missing or empty.")
     print("="*86)
 
     # 6. Chain of Thought Summary
+    # ... (Output format remains the same, content updated by generate_chain_of_thought) ...
     print("\n" + "="*30 + " Chain of Thought Summary " + "="*30)
     print(results_data.get("summary", "No summary generated."))
     print("="*86)
