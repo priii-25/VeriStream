@@ -392,4 +392,67 @@
   display: block;
   background-color: #000; /* Add black background in case image loads slowly */
 }
-/* --- END SUSPICIOUS FRAMES STYLES --- */
+
+/* frontend/src/styles/VideoAnalytics.css */
+
+.fact-check-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.claim-detail.with-speak {
+  display: flex; /* Arrange text and button side-by-side */
+  align-items: flex-start; /* Align items at the top */
+  margin-bottom: 15px; /* Spacing between claims */
+  padding-bottom: 10px;
+  border-bottom: 1px solid #444; /* Separator */
+}
+
+.claim-text {
+  flex-grow: 1; /* Allow text to take up available space */
+  margin-right: 10px; /* Space between text and button */
+}
+.claim-text p {
+  margin-bottom: 5px; /* Adjust spacing within text */
+}
+
+.speak-button, .stop-speak-button {
+  background-color: #007bff;
+  color: white;
+  border: none;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.9em;
+  transition: background-color 0.2s ease;
+  white-space: nowrap; /* Prevent wrapping */
+}
+.speak-button span { /* Style icon */
+  margin-right: 4px;
+}
+
+.speak-button:hover, .stop-speak-button:hover {
+  background-color: #0056b3;
+}
+
+.speak-button:disabled {
+  background-color: #555;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.stop-speak-button.global-stop-button {
+  background-color: #dc3545; /* Red for stop */
+  padding: 6px 12px;
+}
+.stop-speak-button.global-stop-button:hover {
+  background-color: #c82333;
+}
+
+.tts-warning {
+  font-style: italic;
+  color: #aaa;
+  margin-top: 10px;
+}
