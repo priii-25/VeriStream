@@ -1,0 +1,18 @@
+.verify-upload-container {
+  margin: 20px;
+}
+.verify-upload-container input {
+  display: block;
+  margin: 10px 0;
+}
+.verify-upload-container button {
+  padding: 8px 16px;
+  font-size: 1rem;
+}
+.verify-upload-container .error {
+  color: red;
+  margin-top: 10px;
+}
+.verify-upload-container .result {
+  margin-top: 10px;
+}
